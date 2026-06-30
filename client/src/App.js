@@ -1,11 +1,19 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 function App() {
-  const [audioFile, setAudioFile] = useState(null);
+  const [audioFiles, setAudioFiles] = useState([]);
+  const [currentFileIndex, setCurrentFileIndex] = useState(0);
   const [instrument, setInstrument] = useState("guitar");
-  const [outputUrl, setOutputUrl] = useState("");
+
+  const [convertedTracks, setConvertedTracks] = useState([]);
+  const [currentTrackIndex, setCurrentTrackIndex] = useState(-1);
+
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+
+  const [isPlaying, setIsPlaying] = useState(false);
+
+  const audioRef = useRef(null);
 
   const API_URL = "http://localhost:8000/convert";
 
@@ -17,35 +25,113 @@ function App() {
     { value: "cello", label: "Cello" },
   ];
 
-  const handleFileChange = (event) => {
-    const file = event.target.files[0];
+  const currentFile = audioFiles[currentFileIndex] || null;
+  const currentTrack =
+    currentTrackIndex >= 0 ? convertedTracks[currentTrackIndex] : null;
 
-    if (!file) return;
+  useEffect(() => {
+    return () => {
+      stopAudio();
+      convertedTracks.forEach((track) => {
+        URL.revokeObjectURL(track.url);
+      });
+    };
+  }, [convertedTracks]);
 
-    if (!file.type.startsWith("audio/")) {
-      setError("Please upload an audio file only.");
-      setAudioFile(null);
+  const stopAudio = () => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = 0;
+    }
+
+    setIsPlaying(false);
+  };
+
+  const pauseAudio = () => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+    }
+
+    setIsPlaying(false);
+  };
+
+  const playAudio = async () => {
+    if (!currentTrack) {
+      setError("No converted track found. Convert an audio first.");
       return;
     }
 
+    try {
+      setError("");
+      await audioRef.current.play();
+      setIsPlaying(true);
+    } catch (err) {
+      setError("Audio play failed. Please click play again.");
+    }
+  };
+
+  const togglePlayPause = () => {
+    if (!currentTrack) {
+      setError("Please convert an audio first.");
+      return;
+    }
+
+    if (isPlaying) {
+      pauseAudio();
+    } else {
+      playAudio();
+    }
+  };
+
+  const handleFileChange = (event) => {
+    const files = Array.from(event.target.files || []);
+
+    const audioOnly = files.filter((file) => file.type.startsWith("audio/"));
+
+    if (audioOnly.length === 0) {
+      setError("Please upload audio files only.");
+      setAudioFiles([]);
+      setCurrentFileIndex(0);
+      return;
+    }
+
+    stopAudio();
+
     setError("");
-    setAudioFile(file);
-    setOutputUrl("");
+    setAudioFiles(audioOnly);
+    setCurrentFileIndex(0);
+  };
+
+  const handleNextInputFile = () => {
+    if (audioFiles.length <= 1) {
+      setError("Only one input audio selected.");
+      return;
+    }
+
+    stopAudio();
+
+    setCurrentFileIndex((prev) => {
+      if (prev >= audioFiles.length - 1) return 0;
+      return prev + 1;
+    });
+
+    setError("");
   };
 
   const handleConvert = async () => {
-    if (!audioFile) {
+    if (!currentFile) {
       setError("Please upload an audio file first.");
       return;
     }
 
     try {
+      stopAudio();
+
       setLoading(true);
       setError("");
-      setOutputUrl("");
 
       const formData = new FormData();
-      formData.append("audio", audioFile);
+      formData.append("audio", currentFile);
       formData.append("instrument", instrument);
 
       const response = await fetch(API_URL, {
@@ -54,17 +140,63 @@ function App() {
       });
 
       if (!response.ok) {
-        throw new Error("Conversion failed. Backend is not ready yet.");
+        const errorText = await response.text();
+        throw new Error(errorText || "Conversion failed.");
       }
 
       const audioBlob = await response.blob();
       const url = URL.createObjectURL(audioBlob);
-      setOutputUrl(url);
+
+      const newTrack = {
+        url,
+        instrument,
+        originalName: currentFile.name,
+        outputName: `covertone-${instrument}.wav`,
+        createdAt: new Date().toLocaleTimeString(),
+      };
+
+      setConvertedTracks((prev) => {
+        const updated = [...prev, newTrack];
+        setCurrentTrackIndex(updated.length - 1);
+        return updated;
+      });
     } catch (err) {
       setError(err.message || "Something went wrong.");
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleNextConvertedTrack = () => {
+    if (convertedTracks.length <= 1) {
+      setError("Only one converted track available.");
+      return;
+    }
+
+    stopAudio();
+
+    setCurrentTrackIndex((prev) => {
+      if (prev >= convertedTracks.length - 1) return 0;
+      return prev + 1;
+    });
+
+    setError("");
+  };
+
+  const handlePreviousConvertedTrack = () => {
+    if (convertedTracks.length <= 1) {
+      setError("Only one converted track available.");
+      return;
+    }
+
+    stopAudio();
+
+    setCurrentTrackIndex((prev) => {
+      if (prev <= 0) return convertedTracks.length - 1;
+      return prev - 1;
+    });
+
+    setError("");
   };
 
   const styles = {
@@ -80,7 +212,7 @@ function App() {
     },
     card: {
       width: "100%",
-      maxWidth: "650px",
+      maxWidth: "720px",
       background: "#1b1b26",
       border: "1px solid #303044",
       borderRadius: "20px",
@@ -146,8 +278,29 @@ function App() {
       borderRadius: "12px",
       marginBottom: "22px",
       color: "#d0d0e3",
+      lineHeight: "1.6",
     },
     button: {
+      padding: "13px 16px",
+      border: "none",
+      borderRadius: "12px",
+      background: "#6c5ce7",
+      color: "#ffffff",
+      fontSize: "15px",
+      fontWeight: "800",
+      cursor: "pointer",
+    },
+    buttonSecondary: {
+      padding: "13px 16px",
+      border: "1px solid #45455d",
+      borderRadius: "12px",
+      background: "#11111a",
+      color: "#ffffff",
+      fontSize: "15px",
+      fontWeight: "800",
+      cursor: "pointer",
+    },
+    convertButton: {
       width: "100%",
       padding: "16px",
       border: "none",
@@ -157,11 +310,19 @@ function App() {
       fontSize: "16px",
       fontWeight: "800",
       cursor: loading ? "not-allowed" : "pointer",
+      marginTop: "4px",
+    },
+    buttonRow: {
+      display: "flex",
+      gap: "10px",
+      flexWrap: "wrap",
+      marginTop: "14px",
     },
     error: {
       marginTop: "18px",
       color: "#ff7675",
       fontWeight: "700",
+      whiteSpace: "pre-wrap",
     },
     status: {
       marginTop: "18px",
@@ -175,9 +336,12 @@ function App() {
       paddingTop: "22px",
       borderTop: "1px solid #33334a",
     },
-    audio: {
-      width: "100%",
-      marginBottom: "18px",
+    playerBox: {
+      background: "#11111a",
+      border: "1px solid #33334a",
+      padding: "18px",
+      borderRadius: "14px",
+      marginTop: "14px",
     },
     download: {
       display: "inline-block",
@@ -187,6 +351,10 @@ function App() {
       padding: "12px 18px",
       borderRadius: "10px",
       fontWeight: "800",
+    },
+    smallText: {
+      color: "#b7b7c9",
+      fontSize: "14px",
     },
   };
 
@@ -198,8 +366,8 @@ function App() {
         <h1 style={styles.title}>TuneMorph AI</h1>
 
         <p style={styles.subtitle}>
-          Same melody, new instrument. Upload a clean melody or cover audio and
-          convert it into guitar, piano, flute, violin, or cello.
+          Same melody, new instrument. Upload instrumental audio and convert it
+          into guitar, piano, flute, violin, or cello.
         </p>
 
         <div style={styles.formGroup}>
@@ -208,15 +376,26 @@ function App() {
             style={styles.input}
             type="file"
             accept="audio/*"
+            multiple
             onChange={handleFileChange}
           />
         </div>
 
-        {audioFile && (
+        {currentFile && (
           <div style={styles.fileBox}>
-            <strong>Selected file:</strong>
+            <strong>Selected Input:</strong>
             <br />
-            {audioFile.name}
+            {currentFile.name}
+            <br />
+            <span style={styles.smallText}>
+              File {currentFileIndex + 1} of {audioFiles.length}
+            </span>
+
+            <div style={styles.buttonRow}>
+              <button style={styles.buttonSecondary} onClick={handleNextInputFile}>
+                Next Input Song
+              </button>
+            </div>
           </div>
         )}
 
@@ -236,7 +415,7 @@ function App() {
         </div>
 
         <button
-          style={styles.button}
+          style={styles.convertButton}
           onClick={handleConvert}
           disabled={loading}
         >
@@ -247,23 +426,66 @@ function App() {
 
         {loading && (
           <div style={styles.status}>
-            Processing audio. Backend ready হলে এখানে converted output আসবে.
+            Processing audio. Please wait...
           </div>
         )}
 
-        {outputUrl && (
+        <audio
+          ref={audioRef}
+          src={currentTrack ? currentTrack.url : ""}
+          onEnded={handleNextConvertedTrack}
+        />
+
+        {currentTrack && (
           <div style={styles.resultBox}>
             <h2>Converted Output</h2>
 
-            <audio style={styles.audio} controls src={outputUrl}></audio>
+            <div style={styles.playerBox}>
+              <strong>{currentTrack.originalName}</strong>
+              <br />
+              <span style={styles.smallText}>
+                Instrument: {currentTrack.instrument} | Created:{" "}
+                {currentTrack.createdAt}
+              </span>
+              <br />
+              <span style={styles.smallText}>
+                Track {currentTrackIndex + 1} of {convertedTracks.length}
+              </span>
 
-            <a
-              style={styles.download}
-              href={outputUrl}
-              download={`tunemorph-${instrument}.wav`}
-            >
-              Download Output
-            </a>
+              <div style={styles.buttonRow}>
+                <button style={styles.button} onClick={togglePlayPause}>
+                  {isPlaying ? "Pause" : "Play"}
+                </button>
+
+                <button style={styles.buttonSecondary} onClick={stopAudio}>
+                  Stop
+                </button>
+
+                <button
+                  style={styles.buttonSecondary}
+                  onClick={handlePreviousConvertedTrack}
+                >
+                  Previous
+                </button>
+
+                <button
+                  style={styles.buttonSecondary}
+                  onClick={handleNextConvertedTrack}
+                >
+                  Next Song
+                </button>
+              </div>
+
+              <div style={styles.buttonRow}>
+                <a
+                  style={styles.download}
+                  href={currentTrack.url}
+                  download={currentTrack.outputName}
+                >
+                  Download Output
+                </a>
+              </div>
+            </div>
           </div>
         )}
       </section>
