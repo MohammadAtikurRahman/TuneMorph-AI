@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 
 function App() {
+  const API_URL = "http://localhost:8000/convert";
+
   const [audioFiles, setAudioFiles] = useState([]);
   const [currentFileIndex, setCurrentFileIndex] = useState(0);
   const [instrument, setInstrument] = useState("guitar");
@@ -10,19 +12,16 @@ function App() {
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-
   const [isPlaying, setIsPlaying] = useState(false);
 
   const audioRef = useRef(null);
-
-  const API_URL = "http://localhost:8000/convert";
+  const objectUrlsRef = useRef([]);
 
   const instruments = [
     { value: "guitar", label: "Guitar" },
     { value: "piano", label: "Piano" },
     { value: "flute", label: "Flute" },
     { value: "violin", label: "Violin" },
-    { value: "cello", label: "Cello" },
   ];
 
   const currentFile = audioFiles[currentFileIndex] || null;
@@ -31,20 +30,72 @@ function App() {
 
   useEffect(() => {
     return () => {
-      stopAudio();
-      convertedTracks.forEach((track) => {
-        URL.revokeObjectURL(track.url);
+      forceStopAudio();
+
+      objectUrlsRef.current.forEach((url) => {
+        URL.revokeObjectURL(url);
       });
     };
-  }, [convertedTracks]);
+  }, []);
+
+  useEffect(() => {
+    if (!audioRef.current) return;
+
+    audioRef.current.pause();
+    audioRef.current.currentTime = 0;
+    setIsPlaying(false);
+
+    if (currentTrack) {
+      audioRef.current.src = currentTrack.url;
+      audioRef.current.load();
+    } else {
+      audioRef.current.removeAttribute("src");
+      audioRef.current.load();
+    }
+  }, [currentTrackIndex, convertedTracks]);
+
+  const forceStopAudio = () => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = 0;
+      audioRef.current.removeAttribute("src");
+      audioRef.current.load();
+    }
+
+    setIsPlaying(false);
+  };
 
   const stopAudio = () => {
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current.currentTime = 0;
+
+      if (currentTrack) {
+        audioRef.current.src = currentTrack.url;
+        audioRef.current.load();
+      }
     }
 
     setIsPlaying(false);
+  };
+
+  const playAudio = async () => {
+    if (!currentTrack) {
+      setError("Please convert an audio first.");
+      return;
+    }
+
+    try {
+      setError("");
+
+      if (audioRef.current) {
+        audioRef.current.src = currentTrack.url;
+        await audioRef.current.play();
+        setIsPlaying(true);
+      }
+    } catch (err) {
+      setError("Audio play failed. Please click Play again.");
+    }
   };
 
   const pauseAudio = () => {
@@ -53,21 +104,6 @@ function App() {
     }
 
     setIsPlaying(false);
-  };
-
-  const playAudio = async () => {
-    if (!currentTrack) {
-      setError("No converted track found. Convert an audio first.");
-      return;
-    }
-
-    try {
-      setError("");
-      await audioRef.current.play();
-      setIsPlaying(true);
-    } catch (err) {
-      setError("Audio play failed. Please click play again.");
-    }
   };
 
   const togglePlayPause = () => {
@@ -85,21 +121,21 @@ function App() {
 
   const handleFileChange = (event) => {
     const files = Array.from(event.target.files || []);
-
     const audioOnly = files.filter((file) => file.type.startsWith("audio/"));
 
     if (audioOnly.length === 0) {
-      setError("Please upload audio files only.");
+      forceStopAudio();
       setAudioFiles([]);
       setCurrentFileIndex(0);
+      setError("Please upload audio files only.");
       return;
     }
 
-    stopAudio();
+    forceStopAudio();
 
-    setError("");
     setAudioFiles(audioOnly);
     setCurrentFileIndex(0);
+    setError("");
   };
 
   const handleNextInputFile = () => {
@@ -108,7 +144,7 @@ function App() {
       return;
     }
 
-    stopAudio();
+    forceStopAudio();
 
     setCurrentFileIndex((prev) => {
       if (prev >= audioFiles.length - 1) return 0;
@@ -125,7 +161,7 @@ function App() {
     }
 
     try {
-      stopAudio();
+      forceStopAudio();
 
       setLoading(true);
       setError("");
@@ -146,12 +182,13 @@ function App() {
 
       const audioBlob = await response.blob();
       const url = URL.createObjectURL(audioBlob);
+      objectUrlsRef.current.push(url);
 
       const newTrack = {
         url,
         instrument,
         originalName: currentFile.name,
-        outputName: `covertone-${instrument}.wav`,
+        outputName: `tunemorph-${instrument}.wav`,
         createdAt: new Date().toLocaleTimeString(),
       };
 
@@ -160,6 +197,8 @@ function App() {
         setCurrentTrackIndex(updated.length - 1);
         return updated;
       });
+
+      setIsPlaying(false);
     } catch (err) {
       setError(err.message || "Something went wrong.");
     } finally {
@@ -173,7 +212,7 @@ function App() {
       return;
     }
 
-    stopAudio();
+    forceStopAudio();
 
     setCurrentTrackIndex((prev) => {
       if (prev >= convertedTracks.length - 1) return 0;
@@ -189,7 +228,7 @@ function App() {
       return;
     }
 
-    stopAudio();
+    forceStopAudio();
 
     setCurrentTrackIndex((prev) => {
       if (prev <= 0) return convertedTracks.length - 1;
@@ -212,7 +251,7 @@ function App() {
     },
     card: {
       width: "100%",
-      maxWidth: "720px",
+      maxWidth: "760px",
       background: "#1b1b26",
       border: "1px solid #303044",
       borderRadius: "20px",
@@ -280,6 +319,18 @@ function App() {
       color: "#d0d0e3",
       lineHeight: "1.6",
     },
+    convertButton: {
+      width: "100%",
+      padding: "16px",
+      border: "none",
+      borderRadius: "14px",
+      background: loading ? "#55556e" : "#6c5ce7",
+      color: "#ffffff",
+      fontSize: "16px",
+      fontWeight: "800",
+      cursor: loading ? "not-allowed" : "pointer",
+      marginTop: "4px",
+    },
     button: {
       padding: "13px 16px",
       border: "none",
@@ -299,18 +350,6 @@ function App() {
       fontSize: "15px",
       fontWeight: "800",
       cursor: "pointer",
-    },
-    convertButton: {
-      width: "100%",
-      padding: "16px",
-      border: "none",
-      borderRadius: "14px",
-      background: loading ? "#55556e" : "#6c5ce7",
-      color: "#ffffff",
-      fontSize: "16px",
-      fontWeight: "800",
-      cursor: loading ? "not-allowed" : "pointer",
-      marginTop: "4px",
     },
     buttonRow: {
       display: "flex",
@@ -392,7 +431,11 @@ function App() {
             </span>
 
             <div style={styles.buttonRow}>
-              <button style={styles.buttonSecondary} onClick={handleNextInputFile}>
+              <button
+                style={styles.buttonSecondary}
+                type="button"
+                onClick={handleNextInputFile}
+              >
                 Next Input Song
               </button>
             </div>
@@ -416,6 +459,7 @@ function App() {
 
         <button
           style={styles.convertButton}
+          type="button"
           onClick={handleConvert}
           disabled={loading}
         >
@@ -426,14 +470,15 @@ function App() {
 
         {loading && (
           <div style={styles.status}>
-            Processing audio. Please wait...
+            Processing audio. Previous music has been stopped.
           </div>
         )}
 
         <audio
           ref={audioRef}
-          src={currentTrack ? currentTrack.url : ""}
-          onEnded={handleNextConvertedTrack}
+          onEnded={() => {
+            setIsPlaying(false);
+          }}
         />
 
         {currentTrack && (
@@ -453,16 +498,17 @@ function App() {
               </span>
 
               <div style={styles.buttonRow}>
-                <button style={styles.button} onClick={togglePlayPause}>
+                <button style={styles.button} type="button" onClick={togglePlayPause}>
                   {isPlaying ? "Pause" : "Play"}
                 </button>
 
-                <button style={styles.buttonSecondary} onClick={stopAudio}>
+                <button style={styles.buttonSecondary} type="button" onClick={stopAudio}>
                   Stop
                 </button>
 
                 <button
                   style={styles.buttonSecondary}
+                  type="button"
                   onClick={handlePreviousConvertedTrack}
                 >
                   Previous
@@ -470,6 +516,7 @@ function App() {
 
                 <button
                   style={styles.buttonSecondary}
+                  type="button"
                   onClick={handleNextConvertedTrack}
                 >
                   Next Song

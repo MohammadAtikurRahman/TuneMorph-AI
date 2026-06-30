@@ -51,24 +51,20 @@ DEFAULT_SOUNDFONT_PATH = SOUNDFONT_DIR / "FluidR3_GM.sf2"
 @app.get("/")
 def home():
     return {
-        "message": "CoverTone backend is running",
+        "message": "TuneMorph backend is running",
         "status": "ok"
     }
 
 
 def get_soundfont_path(instrument_name: str):
-    """
-    Instrument-specific SoundFont থাকলে সেটা use করবে.
-    না থাকলে FluidR3_GM.sf2 fallback করবে.
-    """
     instrument_name = instrument_name.lower().strip()
+
 
     specific_soundfonts = {
         "guitar": "guitar.sf2",
         "piano": "piano.sf2",
         "flute": "flute.sf2",
-        "violin": "violin.sf2",
-        "cello": "cello.sf2",
+         "violin": "violin.sf2",
     }
 
     file_name = specific_soundfonts.get(instrument_name)
@@ -81,26 +77,23 @@ def get_soundfont_path(instrument_name: str):
         return DEFAULT_SOUNDFONT_PATH, False
 
     raise Exception(
-        "No SoundFont found. Put FluidR3_GM.sf2 or instrument-specific sf2 files inside server/soundfonts/"
+        "No SoundFont found. Put FluidR3_GM.sf2 inside server/soundfonts/"
     )
 
 
 def get_instrument_program(instrument_name: str, using_specific_soundfont: bool) -> int:
-    """
-    Specific sf2 হলে অনেক সময় program 0 লাগে.
-    FluidR3_GM.sf2 fallback হলে proper General MIDI program use করবে.
-    """
     instrument_name = instrument_name.lower().strip()
 
+    # guitar/piano/flute specific sf2 হলে program 0 use করবে
     if using_specific_soundfont:
         return 0
 
+    # FluidR3_GM.sf2 fallback হলে proper GM program use করবে
     program_map = {
         "guitar": "Acoustic Guitar (steel)",
         "piano": "Acoustic Grand Piano",
         "flute": "Flute",
         "violin": "Violin",
-        "cello": "Cello",
     }
 
     gm_name = program_map.get(instrument_name, "Acoustic Grand Piano")
@@ -112,10 +105,6 @@ def get_instrument_program(instrument_name: str, using_specific_soundfont: bool)
 
 
 def clean_midi_notes(midi_data: pretty_midi.PrettyMIDI):
-    """
-    Basic Pitch অনেক সময় tiny/wrong notes বানায়.
-    এই function খুব ছোট note remove করে এবং weak notes একটু boost করে.
-    """
     for midi_instrument in midi_data.instruments:
         if midi_instrument.is_drum:
             continue
@@ -125,15 +114,15 @@ def clean_midi_notes(midi_data: pretty_midi.PrettyMIDI):
         for note in midi_instrument.notes:
             duration = note.end - note.start
 
-            # Extra tiny wrong notes remove
+            # Remove tiny wrong notes
             if duration < 0.08:
                 continue
 
-            # Very low velocity boost
+            # Boost very weak notes
             if note.velocity < 35:
                 note.velocity = 45
 
-            # Very high velocity limit
+            # Limit too strong notes
             if note.velocity > 115:
                 note.velocity = 115
 
@@ -145,12 +134,6 @@ def clean_midi_notes(midi_data: pretty_midi.PrettyMIDI):
 
 
 def render_midi_to_wav(midi_path: Path, wav_path: Path, instrument: str):
-    """
-    MIDI -> WAV using FluidSynth.
-    guitar.sf2/piano.sf2 থাকলে use করবে.
-    না থাকলে FluidR3_GM.sf2 fallback করবে.
-    """
-
     if not FLUIDSYNTH_EXE.exists():
         raise Exception(f"FluidSynth not found: {FLUIDSYNTH_EXE}")
 
@@ -172,6 +155,8 @@ def render_midi_to_wav(midi_path: Path, wav_path: Path, instrument: str):
         using_specific_soundfont
     )
 
+    print("Selected MIDI program:", selected_program)
+
     for midi_instrument in midi_data.instruments:
         if not midi_instrument.is_drum:
             midi_instrument.program = selected_program
@@ -179,15 +164,21 @@ def render_midi_to_wav(midi_path: Path, wav_path: Path, instrument: str):
     prepared_midi_path = midi_path.with_name(f"prepared-{instrument}.mid")
     midi_data.write(str(prepared_midi_path))
 
+    # -a file = speaker/audio device use করবে না
+    # শুধু WAV file render করবে
     command = [
         str(FLUIDSYNTH_EXE),
         "-ni",
-        str(soundfont_path),
-        str(prepared_midi_path),
+        "-a",
+        "file",
         "-F",
         str(wav_path),
+        "-T",
+        "wav",
         "-r",
         "44100",
+        str(soundfont_path),
+        str(prepared_midi_path),
     ]
 
     print("Running FluidSynth command:")
@@ -261,11 +252,11 @@ async def convert_audio(
     if not midi_files:
         raise HTTPException(
             status_code=500,
-            detail="MIDI file was not generated. Try a clean solo flute/piano/vocal melody audio."
+            detail="MIDI file was not generated. Try a clean solo instrumental melody audio."
         )
 
     midi_path = midi_files[0]
-    wav_path = job_output_dir / f"covertone-{instrument}.wav"
+    wav_path = job_output_dir / f"tunemorph-{instrument}.wav"
 
     print("MIDI generated:", midi_path)
     print("Rendering MIDI to WAV with FluidSynth...")
@@ -285,5 +276,5 @@ async def convert_audio(
     return FileResponse(
         path=str(wav_path),
         media_type="audio/wav",
-        filename=f"covertone-{instrument}.wav"
+        filename=f"tunemorph-{instrument}.wav"
     )
