@@ -1,0 +1,60 @@
+# =========================
+# Node / React frontend
+# =========================
+client/node_modules/
+client/dist/
+client/build/
+client/.env
+client/.env.local
+client/.env.development.local
+client/.env.production.local
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# =========================
+# Python backend
+# =========================
+server/venv/
+server/venv311/
+server/__pycache__/
+server/**/*.pyc
+server/**/*.pyo
+server/**/*.pyd
+server/.env
+
+# Python cache/test files
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# =========================
+# App generated files
+# =========================
+server/uploads/
+server/outputs/
+
+# =========================
+# Large audio/model/tool files
+# =========================
+server/soundfonts/
+server/tools/
+
+# Audio output / temp files
+*.wav
+*.mp3
+*.mid
+*.midi
+*.flac
+*.ogg
+
+# =========================
+# OS / Editor
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
