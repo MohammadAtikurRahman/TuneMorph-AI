@@ -119,7 +119,7 @@ function App() {
     }
   };
 
-  const handleFileChange = (event) => {
+  const handleAudioFileChange = (event) => {
     const files = Array.from(event.target.files || []);
     const audioOnly = files.filter((file) => file.type.startsWith("audio/"));
 
@@ -132,6 +132,7 @@ function App() {
     }
 
     forceStopAudio();
+
     setAudioFiles(audioOnly);
     setCurrentFileIndex(0);
     setError("");
@@ -187,7 +188,7 @@ function App() {
         url,
         instrument,
         originalName: currentFile.name,
-        outputName: `tunemorph-${instrument}.wav`,
+        outputName: `tunemorph-${instrument}-final.wav`,
         createdAt: new Date().toLocaleTimeString(),
       };
 
@@ -262,17 +263,16 @@ function App() {
 
         .app-container {
           width: 100%;
-          max-width: 1320px;
+          max-width: 1220px;
           margin: 0 auto;
         }
 
         .topbar {
-          height: 74px;
+          height: 72px;
           display: flex;
           justify-content: space-between;
           align-items: center;
           margin-bottom: 20px;
-          padding: 0 4px;
         }
 
         .brand {
@@ -282,8 +282,8 @@ function App() {
         }
 
         .brand-logo {
-          width: 48px;
-          height: 48px;
+          width: 46px;
+          height: 46px;
           display: grid;
           place-items: center;
           border-radius: 16px;
@@ -305,12 +305,6 @@ function App() {
           font-size: 13px;
         }
 
-        .top-actions {
-          display: flex;
-          align-items: center;
-          gap: 12px;
-        }
-
         .status-pill {
           padding: 9px 13px;
           border-radius: 999px;
@@ -323,13 +317,13 @@ function App() {
 
         .main-layout {
           display: grid;
-          grid-template-columns: 430px minmax(0, 1fr);
+          grid-template-columns: 410px minmax(0, 1fr);
           gap: 20px;
           align-items: stretch;
         }
 
         .panel {
-          min-height: calc(100vh - 120px);
+          min-height: calc(100vh - 116px);
           border-radius: 28px;
           background: rgba(18, 20, 34, 0.86);
           border: 1px solid rgba(255,255,255,0.09);
@@ -338,12 +332,7 @@ function App() {
           overflow: hidden;
         }
 
-        .left-panel {
-          padding: 26px;
-          display: flex;
-          flex-direction: column;
-        }
-
+        .left-panel,
         .right-panel {
           padding: 26px;
           display: flex;
@@ -377,7 +366,7 @@ function App() {
         }
 
         .description {
-          margin: 16px 0 26px;
+          margin: 16px 0 24px;
           color: #a9aec4;
           line-height: 1.65;
           font-size: 14px;
@@ -430,6 +419,7 @@ function App() {
           background: rgba(124, 92, 255, 0.17);
           color: #d8d2ff;
           font-size: 23px;
+          font-weight: 900;
         }
 
         .upload-title {
@@ -742,37 +732,6 @@ function App() {
           font-weight: 950;
         }
 
-        .history-strip {
-          margin-top: 18px;
-          display: grid;
-          grid-template-columns: repeat(4, minmax(0, 1fr));
-          gap: 10px;
-        }
-
-        .history-card {
-          padding: 12px;
-          border-radius: 16px;
-          background: rgba(255,255,255,0.045);
-          border: 1px solid rgba(255,255,255,0.07);
-          min-height: 66px;
-        }
-
-        .history-title {
-          margin: 0;
-          color: #ffffff;
-          font-size: 12px;
-          font-weight: 850;
-          white-space: nowrap;
-          overflow: hidden;
-          text-overflow: ellipsis;
-        }
-
-        .history-meta {
-          margin-top: 5px;
-          color: #858aa0;
-          font-size: 11px;
-        }
-
         @media (max-width: 980px) {
           .main-layout {
             grid-template-columns: 1fr;
@@ -813,10 +772,6 @@ function App() {
             width: 100%;
             height: 130px;
           }
-
-          .history-strip {
-            grid-template-columns: 1fr 1fr;
-          }
         }
       `}</style>
 
@@ -827,14 +782,12 @@ function App() {
               <div className="brand-logo">T</div>
               <div>
                 <h2 className="brand-title">TuneMorph AI</h2>
-                <p className="brand-subtitle">Instrumental conversion studio</p>
+                <p className="brand-subtitle">Audio to instrument converter</p>
               </div>
             </div>
 
-            <div className="top-actions">
-              <div className="status-pill">
-                {loading ? "Processing audio..." : "Ready"}
-              </div>
+            <div className="status-pill">
+              {loading ? "Processing audio..." : "Ready"}
             </div>
           </header>
 
@@ -849,8 +802,8 @@ function App() {
               </h1>
 
               <p className="description">
-                Upload clean instrumental audio and convert the melody into
-                guitar, piano, flute, or violin.
+                Upload clean instrumental audio and convert it into guitar,
+                piano, flute, or violin.
               </p>
 
               <div className="form-stack">
@@ -862,7 +815,7 @@ function App() {
                       type="file"
                       accept="audio/*"
                       multiple
-                      onChange={handleFileChange}
+                      onChange={handleAudioFileChange}
                     />
 
                     <div className="upload-inner">
@@ -879,7 +832,7 @@ function App() {
 
                 {currentFile && (
                   <div className="selected-card">
-                    <div className="selected-label">Selected Input</div>
+                    <div className="selected-label">Selected Audio</div>
                     <div className="selected-name">{currentFile.name}</div>
                     <div className="selected-meta">
                       File {currentFileIndex + 1} of {audioFiles.length}
@@ -925,16 +878,17 @@ function App() {
 
                 {loading && (
                   <div className="status-box">
-                    Processing audio. Previous playback has been stopped.
+                    Processing. Previous playback has been stopped.
                   </div>
                 )}
               </div>
 
               <div className="tips-card">
-                <p className="tips-title">Best input</p>
+                <p className="tips-title">Best quality tip</p>
                 <p className="tips-text">
-                  Clean solo melody gives the best output. Heavy reverb,
-                  drums, bass, or full orchestra can create wrong MIDI notes.
+                  Best result comes from clean solo instrumental melody. Full
+                  songs with drums, bass, or heavy reverb may create wrong MIDI
+                  notes.
                 </p>
               </div>
             </section>
@@ -966,99 +920,82 @@ function App() {
                     <div className="empty-icon">♫</div>
                     <h3 className="empty-title">No output yet</h3>
                     <p className="empty-text">
-                      Upload an instrumental audio file, choose an instrument,
-                      then convert. Your playable WAV output will appear here.
+                      Upload audio, choose an instrument, then convert. Your
+                      final WAV output will appear here.
                     </p>
                   </div>
                 </div>
               )}
 
               {currentTrack && (
-                <>
-                  <div className="player-card">
-                    <div>
-                      <div className="track-main">
-                        <div className="album-art">
-                          {currentTrack.instrument.slice(0, 1).toUpperCase()}
-                        </div>
-
-                        <div className="track-info">
-                          <p className="track-title">
-                            {currentTrack.originalName}
-                          </p>
-
-                          <div className="track-meta">
-                            Created: {currentTrack.createdAt}
-                            <br />
-                            Track {currentTrackIndex + 1} of{" "}
-                            {convertedTracks.length}
-                          </div>
-
-                          <div className="instrument-badge">
-                            {currentTrack.instrument.toUpperCase()} VERSION
-                          </div>
-                        </div>
+                <div className="player-card">
+                  <div>
+                    <div className="track-main">
+                      <div className="album-art">
+                        {currentTrack.instrument.slice(0, 1).toUpperCase()}
                       </div>
-                    </div>
 
-                    <div className="player-controls">
-                      <div className="control-row">
-                        <button
-                          className="play-button"
-                          type="button"
-                          onClick={togglePlayPause}
-                        >
-                          {isPlaying ? "Pause" : "Play"}
-                        </button>
+                      <div className="track-info">
+                        <p className="track-title">{currentTrack.originalName}</p>
 
-                        <button
-                          className="secondary-button"
-                          type="button"
-                          onClick={stopAudio}
-                        >
-                          Stop
-                        </button>
+                        <div className="track-meta">
+                          Created: {currentTrack.createdAt}
+                          <br />
+                          Track {currentTrackIndex + 1} of{" "}
+                          {convertedTracks.length}
+                        </div>
 
-                        <button
-                          className="secondary-button"
-                          type="button"
-                          onClick={handlePreviousConvertedTrack}
-                        >
-                          Previous
-                        </button>
-
-                        <button
-                          className="secondary-button"
-                          type="button"
-                          onClick={handleNextConvertedTrack}
-                        >
-                          Next
-                        </button>
-
-                        <a
-                          className="download-button"
-                          href={currentTrack.url}
-                          download={currentTrack.outputName}
-                        >
-                          Download WAV
-                        </a>
+                        <div className="instrument-badge">
+                          {currentTrack.instrument.toUpperCase()} VERSION
+                        </div>
                       </div>
                     </div>
                   </div>
 
-                  {convertedTracks.length > 0 && (
-                    <div className="history-strip">
-                      {convertedTracks.slice(-4).map((track, index) => (
-                        <div className="history-card" key={`${track.url}-${index}`}>
-                          <p className="history-title">{track.originalName}</p>
-                          <div className="history-meta">
-                            {track.instrument} · {track.createdAt}
-                          </div>
-                        </div>
-                      ))}
+                  <div className="player-controls">
+                    <div className="control-row">
+                      <button
+                        className="play-button"
+                        type="button"
+                        onClick={togglePlayPause}
+                      >
+                        {isPlaying ? "Pause" : "Play"}
+                      </button>
+
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        onClick={stopAudio}
+                      >
+                        Stop
+                      </button>
+
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        onClick={handlePreviousConvertedTrack}
+                      >
+                        Previous
+                      </button>
+
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        onClick={handleNextConvertedTrack}
+                      >
+                        Next
+                      </button>
+
+                      <a
+                        className="download-button"
+                        href={currentTrack.url}
+                        download={currentTrack.outputName}
+                      >
+                        Download WAV
+                      </a>
                     </div>
-                  )}
-                </>
+                  </div>
+                </div>
               )}
             </section>
           </div>
