@@ -1,68 +1,133 @@
 from __future__ import annotations
 
-import math
+import importlib.util
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 import librosa
 import numpy as np
 import pretty_midi
-from basic_pitch import ICASSP_2022_MODEL_PATH
-from basic_pitch.inference import predict
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from scipy.ndimage import median_filter
+from scipy.signal import butter, sosfiltfilt
 from starlette.concurrency import run_in_threadpool
+
+try:
+    import torch
+    import torchcrepe
+
+    TORCHCREPE_IMPORT_ERROR: Exception | None = None
+
+except Exception as import_error:
+    torch = None
+    torchcrepe = None
+    TORCHCREPE_IMPORT_ERROR = import_error
 
 
 # =========================================================
-# PATH CONFIGURATION
+# CONFIGURATION
 # =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 
 UPLOADS_DIR = BASE_DIR / "uploads"
-OUTPUTS_DIR = BASE_DIR / "outputs"
 WORK_DIR = BASE_DIR / "work"
+OUTPUTS_DIR = BASE_DIR / "outputs"
+SOUNDFONTS_DIR = BASE_DIR / "soundfonts"
 
-for directory in (
+for folder in (
     UPLOADS_DIR,
-    OUTPUTS_DIR,
     WORK_DIR,
+    OUTPUTS_DIR,
+    SOUNDFONTS_DIR,
 ):
-    directory.mkdir(parents=True, exist_ok=True)
-
-
-FLUIDSYNTH_EXE = (
-    BASE_DIR
-    / "tools"
-    / "fluidsynth-v2.5.5-win10-x64-glib"
-    / "bin"
-    / "fluidsynth.exe"
-)
-
-PIANO_SF2 = BASE_DIR / "soundfonts" / "piano.sf2"
-
-# piano.sf2 না থাকলে এই SoundFont ব্যবহার করবে।
-if not PIANO_SF2.exists():
-    fallback_soundfont = (
-        BASE_DIR
-        / "soundfonts"
-        / "FluidR3_GM.sf2"
+    folder.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    if fallback_soundfont.exists():
-        PIANO_SF2 = fallback_soundfont
+
+FLUIDSYNTH_EXE = Path(
+    os.getenv(
+        "FLUIDSYNTH_EXE",
+        str(
+            BASE_DIR
+            / "tools"
+            / "fluidsynth-v2.5.5-win10-x64-glib"
+            / "bin"
+            / "fluidsynth.exe"
+        ),
+    )
+)
+
+FFMPEG_EXE = os.getenv(
+    "FFMPEG_EXE",
+    "ffmpeg",
+)
+
+# Better separation, but slower.
+DEMUCS_MODEL = os.getenv(
+    "DEMUCS_MODEL",
+    "htdemucs_ft",
+)
+
+# তোমার installed Demucs integer segment গ্রহণ করে।
+DEMUCS_SEGMENT = os.getenv(
+    "DEMUCS_SEGMENT",
+    "7",
+)
+
+# 2 prediction average করবে।
+DEMUCS_SHIFTS = os.getenv(
+    "DEMUCS_SHIFTS",
+    "2",
+)
+
+MAX_UPLOAD_MB = int(
+    os.getenv(
+        "MAX_UPLOAD_MB",
+        "150",
+    )
+)
+
+OUTPUT_RETENTION_HOURS = int(
+    os.getenv(
+        "OUTPUT_RETENTION_HOURS",
+        "24",
+    )
+)
 
 
-FFMPEG_EXE = "ffmpeg"
-DEMUCS_MODEL = "htdemucs"
-MAX_UPLOAD_MB = 100
+# Pitch tracker settings
+PITCH_SAMPLE_RATE = 16000
+
+# 160 samples = 10 milliseconds
+PITCH_HOP_LENGTH = 160
+
+PITCH_MIN_FREQUENCY = 65.0
+PITCH_MAX_FREQUENCY = 1400.0
+
+PITCH_CONFIDENCE_THRESHOLD = 0.36
+
+MINIMUM_NOTE_SECONDS = 0.085
+MAXIMUM_SHORT_GAP_SECONDS = 0.060
+
+# Timing correction strength.
+# 0 = no correction
+# 1 = fully robotic quantization
+QUANTIZE_STRENGTH = 0.24
+
+GRID_SUBDIVISIONS_PER_BEAT = 4
 
 
 ALLOWED_EXTENSIONS = {
@@ -76,13 +141,39 @@ ALLOWED_EXTENSIONS = {
 }
 
 
+# একসঙ্গে একটির বেশি heavy conversion চলবে না।
+PIPELINE_LOCK = threading.Lock()
+
+
+# =========================================================
+# DATA CLASSES
+# =========================================================
+
+@dataclass
+class NoteEvent:
+    start: float
+    end: float
+    pitch: int
+    confidence: float
+    energy: float
+    velocity: int = 80
+
+    @property
+    def duration(self) -> float:
+        return self.end - self.start
+
+
+class PipelineError(RuntimeError):
+    pass
+
+
 # =========================================================
 # FASTAPI
 # =========================================================
 
 app = FastAPI(
     title="TuneMorph Piano API",
-    version="1.0.0",
+    version="2.0.0",
 )
 
 
@@ -101,16 +192,29 @@ app.add_middleware(
 
 
 # =========================================================
-# ERROR CLASS
-# =========================================================
-
-class PipelineError(RuntimeError):
-    pass
-
-
-# =========================================================
 # GENERAL HELPERS
 # =========================================================
+
+def find_soundfont() -> Path:
+    preferred_files = [
+        SOUNDFONTS_DIR / "piano.sf2",
+        SOUNDFONTS_DIR / "Piano.sf2",
+        SOUNDFONTS_DIR / "FluidR3_GM.sf2",
+    ]
+
+    for path in preferred_files:
+        if path.exists() and path.is_file():
+            return path
+
+    available_files = sorted(
+        SOUNDFONTS_DIR.glob("*.sf2")
+    )
+
+    if available_files:
+        return available_files[0]
+
+    return SOUNDFONTS_DIR / "piano.sf2"
+
 
 def find_executable(
     executable: str | Path,
@@ -121,7 +225,9 @@ def find_executable(
     if path.exists() and path.is_file():
         return str(path.resolve())
 
-    found = shutil.which(str(executable))
+    found = shutil.which(
+        str(executable)
+    )
 
     if found:
         return found
@@ -131,25 +237,48 @@ def find_executable(
     )
 
 
-def require_file(
-    path: Path,
-    label: str,
-) -> None:
-    if not path.exists() or not path.is_file():
+def require_dependencies() -> None:
+    if importlib.util.find_spec("demucs") is None:
         raise PipelineError(
-            f"{label} পাওয়া যায়নি: {path}"
+            "Demucs install করা নেই। চালাও: "
+            r".\venv311\Scripts\python.exe "
+            r"-m pip install demucs"
+        )
+
+    if torch is None or torchcrepe is None:
+        reason = (
+            f" ({TORCHCREPE_IMPORT_ERROR})"
+            if TORCHCREPE_IMPORT_ERROR
+            else ""
+        )
+
+        raise PipelineError(
+            "TorchCREPE load হচ্ছে না"
+            f"{reason}. চালাও: "
+            r".\venv311\Scripts\python.exe "
+            r"-m pip install torchcrepe"
         )
 
 
 def run_command(
     command: list[str],
     timeout: int,
-) -> subprocess.CompletedProcess[str]:
+) -> None:
+    creation_flags = 0
+
+    if os.name == "nt":
+        creation_flags = getattr(
+            subprocess,
+            "CREATE_NO_WINDOW",
+            0,
+        )
+
     process = subprocess.run(
         command,
         text=True,
         capture_output=True,
         timeout=timeout,
+        creationflags=creation_flags,
     )
 
     if process.returncode != 0:
@@ -159,25 +288,47 @@ def run_command(
             or "External command failed."
         )
 
-        raise PipelineError(error_message)
-
-    return process
+        raise PipelineError(
+            error_message
+        )
 
 
 def safe_filename(
     filename: str | None,
 ) -> str:
-    original_name = filename or "music.wav"
+    filename = filename or "music.wav"
 
-    cleaned_name = re.sub(
+    filename = re.sub(
         r"[^A-Za-z0-9._-]+",
         "_",
-        original_name,
+        filename,
     )
 
-    cleaned_name = cleaned_name.strip("._")
+    filename = filename.strip("._")
 
-    return cleaned_name or "music.wav"
+    return filename or "music.wav"
+
+
+def cleanup_old_outputs() -> None:
+    cutoff_time = (
+        time.time()
+        - OUTPUT_RETENTION_HOURS * 3600
+    )
+
+    for folder in OUTPUTS_DIR.iterdir():
+        try:
+            if (
+                folder.is_dir()
+                and folder.stat().st_mtime
+                < cutoff_time
+            ):
+                shutil.rmtree(
+                    folder,
+                    ignore_errors=True,
+                )
+
+        except OSError:
+            continue
 
 
 # =========================================================
@@ -185,7 +336,7 @@ def safe_filename(
 # =========================================================
 
 def normalize_audio(
-    input_path: Path,
+    source_path: Path,
     output_path: Path,
 ) -> None:
     ffmpeg = find_executable(
@@ -197,7 +348,7 @@ def normalize_audio(
         ffmpeg,
         "-y",
         "-i",
-        str(input_path),
+        str(source_path),
         "-vn",
         "-ac",
         "2",
@@ -210,7 +361,7 @@ def normalize_audio(
 
     run_command(
         command,
-        timeout=900,
+        timeout=1200,
     )
 
 
@@ -218,685 +369,1370 @@ def normalize_audio(
 # DEMUCS SEPARATION
 # =========================================================
 
-def get_demucs_device() -> str:
-    try:
-        import torch
+def get_processing_device() -> str:
+    require_dependencies()
 
-        if torch.cuda.is_available():
-            return "cuda"
-
-    except Exception:
-        pass
+    if torch.cuda.is_available():
+        return "cuda"
 
     return "cpu"
 
 
-def separate_instrumental_music(
-    input_audio: Path,
+def separate_music(
+    normalized_audio: Path,
     separation_directory: Path,
 ) -> Path:
-    """
-    Full music থেকে vocals, drums, bass এবং other stem আলাদা করে।
+    require_dependencies()
 
-    আমরা piano melody extraction-এর জন্য other.wav ব্যবহার করি।
-    """
-
-    device = get_demucs_device()
+    device = get_processing_device()
 
     command = [
         sys.executable,
         "-m",
         "demucs",
+
         "-n",
         DEMUCS_MODEL,
+
         "-d",
         device,
+
         "--segment",
-        "7",
+        DEMUCS_SEGMENT,
+
+        "--shifts",
+        DEMUCS_SHIFTS,
+
         "--overlap",
         "0.25",
+
+        "--float32",
+
         "-j",
         "1",
+
         "-o",
         str(separation_directory),
-        str(input_audio),
+
+        str(normalized_audio),
     ]
 
     try:
         run_command(
             command,
-            timeout=3600,
+            timeout=7200,
         )
 
     except PipelineError:
-        # GPU error হলে CPU দিয়ে আবার চেষ্টা করবে।
+        # GPU error হলে CPU-তে retry।
         if device != "cuda":
             raise
 
-        device_index = command.index("-d") + 1
-        command[device_index] = "cpu"
+        device_position = (
+            command.index("-d") + 1
+        )
+
+        command[device_position] = "cpu"
 
         run_command(
             command,
-            timeout=7200,
+            timeout=14400,
         )
 
     output_folder = (
         separation_directory
         / DEMUCS_MODEL
-        / input_audio.stem
+        / normalized_audio.stem
     )
 
-    if not output_folder.exists():
-        raise PipelineError(
-            f"Demucs output folder পাওয়া যায়নি: "
-            f"{output_folder}"
-        )
-
-    other_stem = output_folder / "other.wav"
+    other_stem = (
+        output_folder
+        / "other.wav"
+    )
 
     if not other_stem.exists():
         raise PipelineError(
-            "Demucs other.wav stem তৈরি করেনি।"
+            "Demucs other.wav তৈরি করেনি: "
+            f"{other_stem}"
         )
 
     return other_stem
 
 
 # =========================================================
-# TEMPO DETECTION
+# MELODY AUDIO PREPARATION
 # =========================================================
 
-def estimate_tempo(
-    audio_path: Path,
-) -> float:
+def apply_bandpass_filter(
+    audio: np.ndarray,
+    sample_rate: int,
+) -> np.ndarray:
+    low_frequency = 55.0
+
+    high_frequency = min(
+        5000.0,
+        sample_rate * 0.45,
+    )
+
+    filter_sections = butter(
+        4,
+        [
+            low_frequency,
+            high_frequency,
+        ],
+        btype="bandpass",
+        fs=sample_rate,
+        output="sos",
+    )
+
     try:
-        audio, sample_rate = librosa.load(
+        filtered = sosfiltfilt(
+            filter_sections,
+            audio,
+        )
+
+        return filtered.astype(
+            np.float32
+        )
+
+    except ValueError:
+        return audio.astype(
+            np.float32
+        )
+
+
+def prepare_pitch_audio(
+    audio_path: Path,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    int,
+]:
+    original_audio, sample_rate = (
+        librosa.load(
             str(audio_path),
-            sr=22050,
+            sr=PITCH_SAMPLE_RATE,
             mono=True,
         )
+    )
 
-        if audio.size == 0:
-            return 120.0
-
-        tempo, _ = librosa.beat.beat_track(
-            y=audio,
-            sr=sample_rate,
+    if (
+        original_audio.size
+        < sample_rate // 2
+    ):
+        raise PipelineError(
+            "Audio file খুব ছোট বা খালি।"
         )
 
-        tempo_value = float(
-            np.asarray(tempo).reshape(-1)[0]
+    original_audio = np.nan_to_num(
+        original_audio,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    ).astype(np.float32)
+
+    original_peak = float(
+        np.max(
+            np.abs(original_audio)
+        )
+    )
+
+    if original_peak < 1e-6:
+        raise PipelineError(
+            "Audio-তে ব্যবহারযোগ্য "
+            "signal পাওয়া যায়নি।"
         )
 
-        if not np.isfinite(tempo_value):
-            return 120.0
-
-        if tempo_value < 45:
-            return 120.0
-
-        if tempo_value > 220:
-            return 120.0
-
-        return tempo_value
-
-    except Exception:
-        return 120.0
-
-
-# =========================================================
-# BASIC PITCH TRANSCRIPTION
-# =========================================================
-
-def transcribe_music(
-    audio_path: Path,
-) -> pretty_midi.PrettyMIDI:
-    """
-    Audio থেকে MIDI notes detect করে।
-    """
-
-    _, midi_data, _ = predict(
-        audio_path,
-        ICASSP_2022_MODEL_PATH,
-
-        # বেশি false note আটকানোর জন্য।
-        onset_threshold=0.58,
-        frame_threshold=0.34,
-
-        # খুব ছোট accidental note বাদ দেওয়ার জন্য।
-        minimum_note_length=110.0,
-
-        # C2 থেকে C7 range।
-        minimum_frequency=float(
-            librosa.note_to_hz("C2")
-        ),
-        maximum_frequency=float(
-            librosa.note_to_hz("C7")
-        ),
-
-        multiple_pitch_bends=False,
-        melodia_trick=True,
+    original_audio = (
+        original_audio
+        / original_peak
     )
 
-    return midi_data
-
-
-# =========================================================
-# MIDI CLEANING
-# =========================================================
-
-def copy_note(
-    note: pretty_midi.Note,
-) -> pretty_midi.Note:
-    return pretty_midi.Note(
-        velocity=int(note.velocity),
-        pitch=int(note.pitch),
-        start=float(note.start),
-        end=float(note.end),
+    # Percussion এবং noise কমিয়ে
+    # sustained melody বাড়ায়।
+    harmonic_audio = (
+        librosa.effects.harmonic(
+            original_audio,
+            margin=4.0,
+        )
+        .astype(np.float32)
     )
 
-
-def collect_all_notes(
-    midi_data: pretty_midi.PrettyMIDI,
-) -> list[pretty_midi.Note]:
-    notes: list[pretty_midi.Note] = []
-
-    for instrument in midi_data.instruments:
-        if instrument.is_drum:
-            continue
-
-        for note in instrument.notes:
-            duration = note.end - note.start
-
-            # অত্যন্ত ছোট note বাদ।
-            if duration < 0.10:
-                continue
-
-            # Piano melody range।
-            if note.pitch < 36:
-                continue
-
-            if note.pitch > 96:
-                continue
-
-            # খুব দুর্বল note বাদ।
-            if note.velocity < 18:
-                continue
-
-            notes.append(
-                copy_note(note)
-            )
-
-    return sorted(
-        notes,
-        key=lambda note: (
-            note.start,
-            -note.velocity,
-            -note.pitch,
-        ),
+    # শুধু harmonic রাখলে attack হারাতে পারে,
+    # তাই original-এর অল্প অংশ রাখা হচ্ছে।
+    pitch_audio = (
+        harmonic_audio * 0.88
+        + original_audio * 0.12
     )
 
-
-def group_nearby_onsets(
-    notes: list[pretty_midi.Note],
-    threshold: float = 0.075,
-) -> list[list[pretty_midi.Note]]:
-    if not notes:
-        return []
-
-    groups: list[list[pretty_midi.Note]] = []
-
-    current_group = [notes[0]]
-    group_start = notes[0].start
-
-    for note in notes[1:]:
-        if note.start - group_start <= threshold:
-            current_group.append(note)
-
-        else:
-            groups.append(current_group)
-
-            current_group = [note]
-            group_start = note.start
-
-    groups.append(current_group)
-
-    return groups
-
-
-def note_quality_score(
-    note: pretty_midi.Note,
-) -> float:
-    duration = min(
-        note.end - note.start,
-        1.6,
+    pitch_audio = apply_bandpass_filter(
+        pitch_audio,
+        sample_rate,
     )
 
-    velocity_score = (
-        note.velocity / 127.0
-    ) * 1.55
+    pitch_peak = float(
+        np.max(
+            np.abs(pitch_audio)
+        )
+    )
 
-    duration_score = duration * 0.35
-
-    register_score = 0.0
-
-    # সাধারণ melody register।
-    if 55 <= note.pitch <= 88:
-        register_score = 0.35
-
-    elif note.pitch < 48:
-        register_score = -0.30
+    if pitch_peak > 1e-6:
+        pitch_audio = (
+            pitch_audio
+            / pitch_peak
+            * 0.95
+        )
 
     return (
-        velocity_score
-        + duration_score
-        + register_score
+        original_audio.astype(
+            np.float32
+        ),
+        pitch_audio.astype(
+            np.float32
+        ),
+        sample_rate,
     )
 
 
-def melody_transition_score(
-    previous_note: pretty_midi.Note,
-    current_note: pretty_midi.Note,
-) -> float:
-    pitch_jump = abs(
-        current_note.pitch
-        - previous_note.pitch
+# =========================================================
+# TORCHCREPE PITCH TRACKING
+# =========================================================
+
+def predict_pitch_on_device(
+    audio_tensor,
+    sample_rate: int,
+    device: str,
+):
+    device_audio = audio_tensor.to(
+        device
     )
 
-    if pitch_jump <= 2:
-        pitch_score = 0.60
-
-    elif pitch_jump <= 5:
-        pitch_score = 0.42
-
-    elif pitch_jump <= 7:
-        pitch_score = 0.25
-
-    elif pitch_jump <= 12:
-        pitch_score = -0.12
-
-    else:
-        pitch_score = (
-            -0.12
-            - (pitch_jump - 12) * 0.075
-        )
-
-    gap = max(
-        0.0,
-        current_note.start
-        - previous_note.end,
+    batch_size = (
+        1024
+        if device.startswith("cuda")
+        else 256
     )
 
-    gap_penalty = (
-        -max(0.0, gap - 1.5) * 0.10
-    )
-
-    return pitch_score + gap_penalty
-
-
-def select_main_melody(
-    notes: list[pretty_midi.Note],
-) -> list[pretty_midi.Note]:
-    """
-    একই সময়ে একাধিক note থাকলে dynamic programming দিয়ে
-    সবচেয়ে smooth এবং likely melody line নির্বাচন করে।
-    """
-
-    groups = group_nearby_onsets(notes)
-
-    if not groups:
-        return []
-
-    candidates: list[
-        list[pretty_midi.Note]
-    ] = []
-
-    for group in groups:
-        strongest_notes = sorted(
-            group,
-            key=note_quality_score,
-            reverse=True,
-        )[:6]
-
-        candidates.append(strongest_notes)
-
-    scores: list[list[float]] = []
-    backtrack: list[list[int]] = []
-
-    first_scores = [
-        note_quality_score(note)
-        for note in candidates[0]
-    ]
-
-    scores.append(first_scores)
-    backtrack.append(
-        [-1] * len(candidates[0])
-    )
-
-    for group_index in range(
-        1,
-        len(candidates),
-    ):
-        current_scores: list[float] = []
-        current_backtrack: list[int] = []
-
-        for current_note in candidates[group_index]:
-            best_score = -float("inf")
-            best_previous_index = 0
-
-            for (
-                previous_index,
-                previous_note,
-            ) in enumerate(
-                candidates[group_index - 1]
-            ):
-                candidate_score = (
-                    scores[group_index - 1][
-                        previous_index
-                    ]
-                    + note_quality_score(
-                        current_note
-                    )
-                    + melody_transition_score(
-                        previous_note,
-                        current_note,
-                    )
-                )
-
-                if candidate_score > best_score:
-                    best_score = candidate_score
-                    best_previous_index = (
-                        previous_index
-                    )
-
-            current_scores.append(best_score)
-
-            current_backtrack.append(
-                best_previous_index
-            )
-
-        scores.append(current_scores)
-        backtrack.append(current_backtrack)
-
-    selected_index = int(
-        np.argmax(scores[-1])
-    )
-
-    selected_reverse: list[
-        pretty_midi.Note
-    ] = []
-
-    for group_index in range(
-        len(candidates) - 1,
-        -1,
-        -1,
-    ):
-        selected_reverse.append(
-            copy_note(
-                candidates[group_index][
-                    selected_index
-                ]
-            )
-        )
-
-        selected_index = backtrack[
-            group_index
-        ][selected_index]
-
-        if selected_index < 0:
-            break
-
-    selected_notes = list(
-        reversed(selected_reverse)
-    )
-
-    return selected_notes
-
-
-def repair_octave_errors(
-    notes: list[pretty_midi.Note],
-) -> None:
-    """
-    Basic Pitch-এর probable octave jump ভুল ঠিক করে।
-    """
-
-    for index in range(
-        1,
-        len(notes),
-    ):
-        previous_pitch = (
-            notes[index - 1].pitch
-        )
-
-        original_pitch = (
-            notes[index].pitch
-        )
-
-        candidate_pitches = [
-            original_pitch - 24,
-            original_pitch - 12,
-            original_pitch,
-            original_pitch + 12,
-            original_pitch + 24,
-        ]
-
-        candidate_pitches = [
-            pitch
-            for pitch in candidate_pitches
-            if 36 <= pitch <= 96
-        ]
-
-        nearest_pitch = min(
-            candidate_pitches,
-            key=lambda pitch: abs(
-                pitch - previous_pitch
+    pitch, periodicity = (
+        torchcrepe.predict(
+            device_audio,
+            sample_rate,
+            PITCH_HOP_LENGTH,
+            PITCH_MIN_FREQUENCY,
+            PITCH_MAX_FREQUENCY,
+            "full",
+            decoder=(
+                torchcrepe
+                .decode
+                .viterbi
             ),
+            return_periodicity=True,
+            batch_size=batch_size,
+            device=device,
+            pad=True,
         )
+    )
 
-        original_jump = abs(
-            original_pitch - previous_pitch
+    # Silent frame-এ false pitch কমায়।
+    periodicity = (
+        torchcrepe.threshold.Silence(
+            -55.0
+        )(
+            periodicity,
+            device_audio,
+            sample_rate,
+            PITCH_HOP_LENGTH,
         )
+    )
 
-        corrected_jump = abs(
-            nearest_pitch - previous_pitch
+    # Confidence signal smooth করা।
+    periodicity = (
+        torchcrepe.filter.median(
+            periodicity,
+            5,
         )
+    )
 
-        # Only obvious octave mistakes।
-        if (
-            original_jump >= 13
-            and corrected_jump <= 7
-        ):
-            notes[index].pitch = (
-                nearest_pitch
+    # Low-confidence pitch বাদ।
+    pitch = (
+        torchcrepe.threshold.At(
+            PITCH_CONFIDENCE_THRESHOLD
+        )(
+            pitch,
+            periodicity,
+        )
+    )
+
+    # Pitch quantization noise কমানো।
+    pitch = (
+        torchcrepe.filter.mean(
+            pitch,
+            3,
+        )
+    )
+
+    return pitch, periodicity
+
+
+def track_pitch(
+    audio: np.ndarray,
+    sample_rate: int,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+]:
+    require_dependencies()
+
+    audio_tensor = (
+        torch.from_numpy(audio)
+        .float()
+        .unsqueeze(0)
+    )
+
+    device = (
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    try:
+        with torch.inference_mode():
+            pitch, periodicity = (
+                predict_pitch_on_device(
+                    audio_tensor,
+                    sample_rate,
+                    device,
+                )
             )
 
+    except RuntimeError as error:
+        if device != "cuda":
+            raise PipelineError(
+                "TorchCREPE pitch detection "
+                f"failed: {error}"
+            ) from error
 
-def merge_repeated_notes(
-    notes: list[pretty_midi.Note],
-) -> list[pretty_midi.Note]:
-    if not notes:
-        return []
+        torch.cuda.empty_cache()
 
-    cleaned: list[
-        pretty_midi.Note
-    ] = []
+        with torch.inference_mode():
+            pitch, periodicity = (
+                predict_pitch_on_device(
+                    audio_tensor,
+                    sample_rate,
+                    "cpu",
+                )
+            )
 
-    minimum_duration = 0.10
+    pitch_array = (
+        pitch
+        .detach()
+        .cpu()
+        .numpy()
+        .reshape(-1)
+        .astype(np.float64)
+    )
 
-    for note in notes:
-        if not cleaned:
-            cleaned.append(note)
+    periodicity_array = (
+        periodicity
+        .detach()
+        .cpu()
+        .numpy()
+        .reshape(-1)
+        .astype(np.float64)
+    )
+
+    return (
+        pitch_array,
+        periodicity_array,
+    )
+
+
+# =========================================================
+# AUDIO FEATURES
+# =========================================================
+
+def fit_array_length(
+    values: np.ndarray,
+    target_length: int,
+) -> np.ndarray:
+    values = np.asarray(
+        values
+    ).reshape(-1)
+
+    if len(values) >= target_length:
+        return values[
+            :target_length
+        ]
+
+    return np.pad(
+        values,
+        (
+            0,
+            target_length - len(values),
+        ),
+        mode="constant",
+    )
+
+
+def calculate_frame_features(
+    original_audio: np.ndarray,
+    sample_rate: int,
+    frame_count: int,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    float,
+]:
+    rms = librosa.feature.rms(
+        y=original_audio,
+        frame_length=1024,
+        hop_length=PITCH_HOP_LENGTH,
+        center=True,
+    )[0]
+
+    onset_envelope = (
+        librosa.onset.onset_strength(
+            y=original_audio,
+            sr=sample_rate,
+            hop_length=PITCH_HOP_LENGTH,
+        )
+    )
+
+    tempo, beat_frames = (
+        librosa.beat.beat_track(
+            y=original_audio,
+            sr=sample_rate,
+            hop_length=PITCH_HOP_LENGTH,
+            units="frames",
+        )
+    )
+
+    tempo_value = float(
+        np.asarray(tempo)
+        .reshape(-1)[0]
+    )
+
+    if (
+        not np.isfinite(tempo_value)
+        or tempo_value < 40
+        or tempo_value > 240
+    ):
+        tempo_value = 120.0
+
+    return (
+        fit_array_length(
+            rms,
+            frame_count,
+        ),
+        fit_array_length(
+            onset_envelope,
+            frame_count,
+        ),
+        np.asarray(
+            beat_frames,
+            dtype=int,
+        ),
+        tempo_value,
+    )
+
+
+# =========================================================
+# PITCH TO MIDI LABELS
+# =========================================================
+
+def frequency_to_midi(
+    pitch_hz: np.ndarray,
+) -> np.ndarray:
+    midi_pitch = np.full(
+        pitch_hz.shape,
+        np.nan,
+        dtype=np.float64,
+    )
+
+    valid = (
+        np.isfinite(pitch_hz)
+        & (pitch_hz > 0)
+    )
+
+    midi_pitch[valid] = (
+        69.0
+        + 12.0
+        * np.log2(
+            pitch_hz[valid] / 440.0
+        )
+    )
+
+    return midi_pitch
+
+
+def smooth_pitch_labels(
+    midi_pitch: np.ndarray,
+    periodicity: np.ndarray,
+) -> np.ndarray:
+    voiced = (
+        np.isfinite(midi_pitch)
+        & (
+            periodicity
+            >= PITCH_CONFIDENCE_THRESHOLD
+        )
+    )
+
+    labels = np.full(
+        len(midi_pitch),
+        -1,
+        dtype=np.int16,
+    )
+
+    if not np.any(voiced):
+        return labels
+
+    raw_labels = np.rint(
+        np.nan_to_num(
+            midi_pitch,
+            nan=0.0,
+        )
+    ).astype(np.int16)
+
+    voiced_indices = np.flatnonzero(
+        voiced
+    )
+
+    island_start = 0
+
+    while island_start < len(
+        voiced_indices
+    ):
+        island_end = (
+            island_start + 1
+        )
+
+        while (
+            island_end
+            < len(voiced_indices)
+            and voiced_indices[island_end]
+            == voiced_indices[
+                island_end - 1
+            ] + 1
+        ):
+            island_end += 1
+
+        island_indices = (
+            voiced_indices[
+                island_start:island_end
+            ]
+        )
+
+        island_labels = raw_labels[
+            island_indices
+        ]
+
+        if len(island_labels) >= 5:
+            island_labels = (
+                median_filter(
+                    island_labels,
+                    size=5,
+                    mode="nearest",
+                )
+            )
+
+        labels[
+            island_indices
+        ] = island_labels
+
+        island_start = island_end
+
+    maximum_gap_frames = max(
+        1,
+        round(
+            MAXIMUM_SHORT_GAP_SECONDS
+            * PITCH_SAMPLE_RATE
+            / PITCH_HOP_LENGTH
+        ),
+    )
+
+    frame_index = 0
+
+    while frame_index < len(labels):
+        if labels[frame_index] >= 0:
+            frame_index += 1
             continue
 
-        previous_note = cleaned[-1]
+        gap_start = frame_index
 
-        # একই note অল্প gap-এ আবার detect হলে merge।
-        if (
-            note.pitch
-            == previous_note.pitch
-            and note.start
-            - previous_note.end
-            <= 0.075
+        while (
+            frame_index < len(labels)
+            and labels[frame_index] < 0
         ):
-            previous_note.end = max(
-                previous_note.end,
-                note.end,
-            )
+            frame_index += 1
 
-            previous_note.velocity = max(
-                previous_note.velocity,
-                note.velocity,
-            )
+        gap_end = frame_index
 
-            continue
+        left_pitch = (
+            labels[gap_start - 1]
+            if gap_start > 0
+            else -1
+        )
 
-        # একসঙ্গে দুটি melody note বাজতে দেবে না।
-        if note.start < previous_note.end:
-            previous_note.end = max(
-                previous_note.start
-                + minimum_duration,
-                note.start,
-            )
+        right_pitch = (
+            labels[gap_end]
+            if gap_end < len(labels)
+            else -1
+        )
 
         if (
-            previous_note.end
-            - previous_note.start
-            < minimum_duration
+            gap_end - gap_start
+            <= maximum_gap_frames
+            and left_pitch >= 0
+            and right_pitch >= 0
+            and abs(
+                int(left_pitch)
+                - int(right_pitch)
+            ) <= 1
         ):
-            cleaned.pop()
+            labels[
+                gap_start:gap_end
+            ] = left_pitch
 
-        cleaned.append(note)
+    return labels
+
+
+# =========================================================
+# ONSET DETECTION
+# =========================================================
+
+def get_strong_onset_frames(
+    onset_envelope: np.ndarray,
+) -> set[int]:
+    positive_values = (
+        onset_envelope[
+            onset_envelope > 0
+        ]
+    )
+
+    if positive_values.size == 0:
+        return set()
+
+    strength_threshold = float(
+        np.percentile(
+            positive_values,
+            72,
+        )
+    )
+
+    peak_frames = (
+        librosa.util.peak_pick(
+            onset_envelope,
+            pre_max=3,
+            post_max=3,
+            pre_avg=6,
+            post_avg=6,
+            delta=max(
+                0.05,
+                strength_threshold * 0.10,
+            ),
+            wait=5,
+        )
+    )
+
+    return {
+        int(frame)
+        for frame in peak_frames
+        if (
+            onset_envelope[frame]
+            >= strength_threshold
+        )
+    }
+
+
+def split_pitch_run_at_onsets(
+    start_frame: int,
+    end_frame: int,
+    onset_frames: set[int],
+    minimum_frames: int,
+) -> list[tuple[int, int]]:
+    boundaries = [start_frame]
+
+    for onset_frame in sorted(
+        onset_frames
+    ):
+        if (
+            start_frame
+            < onset_frame
+            < end_frame
+            and onset_frame
+            - boundaries[-1]
+            >= minimum_frames
+            and end_frame
+            - onset_frame
+            >= minimum_frames
+        ):
+            boundaries.append(
+                onset_frame
+            )
+
+    boundaries.append(
+        end_frame
+    )
 
     return [
-        note
-        for note in cleaned
-        if (
-            note.end - note.start
-            >= minimum_duration
+        (
+            boundaries[index],
+            boundaries[index + 1],
+        )
+        for index in range(
+            len(boundaries) - 1
         )
     ]
 
 
-def quantize_notes(
-    notes: list[pretty_midi.Note],
-    tempo: float,
-) -> None:
-    """
-    Timing একদম robotic না করে 30% quantization করে।
-    """
+# =========================================================
+# LABELS TO NOTES
+# =========================================================
 
-    quantize_strength = 0.30
-
-    beat_seconds = (
-        60.0 / max(tempo, 1.0)
+def labels_to_note_events(
+    labels: np.ndarray,
+    midi_pitch: np.ndarray,
+    periodicity: np.ndarray,
+    rms: np.ndarray,
+    onset_envelope: np.ndarray,
+) -> list[NoteEvent]:
+    hop_seconds = (
+        PITCH_HOP_LENGTH
+        / PITCH_SAMPLE_RATE
     )
 
-    # 1/16 note grid।
-    grid_seconds = beat_seconds / 4.0
+    minimum_frames = max(
+        3,
+        round(
+            MINIMUM_NOTE_SECONDS
+            / hop_seconds
+        ),
+    )
 
-    for note in notes:
-        quantized_start = round(
-            note.start / grid_seconds
-        ) * grid_seconds
+    onset_frames = (
+        get_strong_onset_frames(
+            onset_envelope
+        )
+    )
 
-        quantized_end = round(
-            note.end / grid_seconds
-        ) * grid_seconds
+    events: list[NoteEvent] = []
 
-        note.start = (
-            note.start
-            * (1.0 - quantize_strength)
-            + quantized_start
-            * quantize_strength
+    frame_index = 0
+
+    while frame_index < len(labels):
+        pitch_label = int(
+            labels[frame_index]
         )
 
-        note.end = (
-            note.end
-            * (1.0 - quantize_strength)
-            + quantized_end
-            * quantize_strength
+        if pitch_label < 0:
+            frame_index += 1
+            continue
+
+        run_start = frame_index
+
+        frame_index += 1
+
+        while (
+            frame_index < len(labels)
+            and int(labels[frame_index])
+            == pitch_label
+        ):
+            frame_index += 1
+
+        run_end = frame_index
+
+        if (
+            run_end - run_start
+            < minimum_frames
+        ):
+            continue
+
+        parts = split_pitch_run_at_onsets(
+            run_start,
+            run_end,
+            onset_frames,
+            minimum_frames,
         )
 
-        if note.end - note.start < 0.10:
-            note.end = note.start + 0.10
+        for part_start, part_end in parts:
+            if (
+                part_end - part_start
+                < minimum_frames
+            ):
+                continue
+
+            pitch_values = midi_pitch[
+                part_start:part_end
+            ]
+
+            pitch_values = (
+                pitch_values[
+                    np.isfinite(
+                        pitch_values
+                    )
+                ]
+            )
+
+            if pitch_values.size:
+                final_pitch = int(
+                    np.rint(
+                        np.median(
+                            pitch_values
+                        )
+                    )
+                )
+            else:
+                final_pitch = pitch_label
+
+            final_pitch = int(
+                np.clip(
+                    final_pitch,
+                    36,
+                    96,
+                )
+            )
+
+            confidence = float(
+                np.nanmedian(
+                    periodicity[
+                        part_start:part_end
+                    ]
+                )
+            )
+
+            energy = float(
+                np.nanmedian(
+                    rms[
+                        part_start:part_end
+                    ]
+                )
+            )
+
+            events.append(
+                NoteEvent(
+                    start=(
+                        part_start
+                        * hop_seconds
+                    ),
+                    end=(
+                        part_end
+                        * hop_seconds
+                    ),
+                    pitch=final_pitch,
+                    confidence=confidence,
+                    energy=energy,
+                )
+            )
+
+    return events
 
 
-def improve_piano_velocity(
-    notes: list[pretty_midi.Note],
+# =========================================================
+# NOTE CLEANUP
+# =========================================================
+
+def clean_note_events(
+    events: list[NoteEvent],
+) -> list[NoteEvent]:
+    cleaned: list[NoteEvent] = []
+
+    for event in events:
+        if (
+            event.duration
+            < MINIMUM_NOTE_SECONDS
+        ):
+            continue
+
+        if not cleaned:
+            cleaned.append(event)
+            continue
+
+        previous = cleaned[-1]
+
+        gap = (
+            event.start
+            - previous.end
+        )
+
+        # একই note-এর ছোট gap merge।
+        if (
+            event.pitch
+            == previous.pitch
+            and gap
+            <= MAXIMUM_SHORT_GAP_SECONDS
+        ):
+            previous.end = max(
+                previous.end,
+                event.end,
+            )
+
+            previous.confidence = max(
+                previous.confidence,
+                event.confidence,
+            )
+
+            previous.energy = max(
+                previous.energy,
+                event.energy,
+            )
+
+            continue
+
+        # Monophonic melody:
+        # একসঙ্গে দুই note বাজবে না।
+        if event.start < previous.end:
+            previous.end = (
+                event.start - 0.005
+            )
+
+            if (
+                previous.duration
+                < MINIMUM_NOTE_SECONDS
+            ):
+                cleaned.pop()
+
+        cleaned.append(event)
+
+    # Short isolated octave glitch repair।
+    event_index = 1
+
+    while (
+        event_index
+        < len(cleaned) - 1
+    ):
+        previous = cleaned[
+            event_index - 1
+        ]
+
+        current = cleaned[
+            event_index
+        ]
+
+        following = cleaned[
+            event_index + 1
+        ]
+
+        probable_glitch = (
+            current.duration <= 0.22
+            and abs(
+                current.pitch
+                - previous.pitch
+            ) >= 10
+            and abs(
+                current.pitch
+                - following.pitch
+            ) >= 10
+            and abs(
+                previous.pitch
+                - following.pitch
+            ) <= 2
+        )
+
+        if probable_glitch:
+            candidates = [
+                current.pitch - 24,
+                current.pitch - 12,
+                current.pitch,
+                current.pitch + 12,
+                current.pitch + 24,
+            ]
+
+            candidates = [
+                pitch
+                for pitch in candidates
+                if 36 <= pitch <= 96
+            ]
+
+            target_pitch = (
+                previous.pitch
+                + following.pitch
+            ) / 2.0
+
+            corrected_pitch = min(
+                candidates,
+                key=lambda pitch: abs(
+                    pitch - target_pitch
+                ),
+            )
+
+            if (
+                abs(
+                    corrected_pitch
+                    - target_pitch
+                ) <= 4
+            ):
+                current.pitch = int(
+                    corrected_pitch
+                )
+
+            elif current.confidence < 0.48:
+                previous.end = current.end
+
+                cleaned.pop(
+                    event_index
+                )
+
+                continue
+
+        event_index += 1
+
+    return cleaned
+
+
+# =========================================================
+# BEAT-AWARE TIMING
+# =========================================================
+
+def create_timing_grid(
+    beat_frames: np.ndarray,
+    tempo: float,
+    duration: float,
+) -> np.ndarray:
+    hop_seconds = (
+        PITCH_HOP_LENGTH
+        / PITCH_SAMPLE_RATE
+    )
+
+    beat_times = (
+        np.asarray(
+            beat_frames,
+            dtype=float,
+        )
+        * hop_seconds
+    )
+
+    if len(beat_times) >= 2:
+        beat_interval = float(
+            np.median(
+                np.diff(beat_times)
+            )
+        )
+    else:
+        beat_interval = (
+            60.0 / max(
+                tempo,
+                1.0,
+            )
+        )
+
+    beat_interval = float(
+        np.clip(
+            beat_interval,
+            0.25,
+            1.5,
+        )
+    )
+
+    if len(beat_times):
+        first_beat = float(
+            beat_times[0]
+        )
+    else:
+        first_beat = 0.0
+
+    while first_beat > 0:
+        first_beat -= beat_interval
+
+    if len(beat_times):
+        final_beat = float(
+            beat_times[-1]
+        )
+    else:
+        final_beat = beat_interval
+
+    while (
+        final_beat
+        < duration + beat_interval
+    ):
+        final_beat += beat_interval
+
+    extended_beats = np.arange(
+        first_beat,
+        final_beat
+        + beat_interval * 0.5,
+        beat_interval,
+    )
+
+    grid: list[float] = []
+
+    for index in range(
+        len(extended_beats) - 1
+    ):
+        beat_start = (
+            extended_beats[index]
+        )
+
+        for subdivision in range(
+            GRID_SUBDIVISIONS_PER_BEAT
+        ):
+            grid.append(
+                beat_start
+                + beat_interval
+                * subdivision
+                / GRID_SUBDIVISIONS_PER_BEAT
+            )
+
+    return np.asarray(
+        [
+            value
+            for value in grid
+            if value >= 0
+        ],
+        dtype=np.float64,
+    )
+
+
+def find_nearest_grid_time(
+    value: float,
+    grid: np.ndarray,
+) -> float:
+    if grid.size == 0:
+        return value
+
+    position = int(
+        np.searchsorted(
+            grid,
+            value,
+        )
+    )
+
+    candidates: list[float] = []
+
+    if position < len(grid):
+        candidates.append(
+            float(grid[position])
+        )
+
+    if position > 0:
+        candidates.append(
+            float(
+                grid[position - 1]
+            )
+        )
+
+    if not candidates:
+        return value
+
+    return min(
+        candidates,
+        key=lambda item: abs(
+            item - value
+        ),
+    )
+
+
+def quantize_note_events(
+    events: list[NoteEvent],
+    beat_frames: np.ndarray,
+    tempo: float,
+) -> list[NoteEvent]:
+    if not events:
+        return []
+
+    timing_grid = create_timing_grid(
+        beat_frames,
+        tempo,
+        events[-1].end,
+    )
+
+    for event in events:
+        original_start = event.start
+        original_end = event.end
+
+        snapped_start = (
+            find_nearest_grid_time(
+                original_start,
+                timing_grid,
+            )
+        )
+
+        snapped_end = (
+            find_nearest_grid_time(
+                original_end,
+                timing_grid,
+            )
+        )
+
+        event.start = (
+            original_start
+            * (1.0 - QUANTIZE_STRENGTH)
+            + snapped_start
+            * QUANTIZE_STRENGTH
+        )
+
+        event.end = (
+            original_end
+            * (1.0 - QUANTIZE_STRENGTH)
+            + snapped_end
+            * QUANTIZE_STRENGTH
+        )
+
+        if (
+            event.end - event.start
+            < MINIMUM_NOTE_SECONDS
+        ):
+            event.end = (
+                event.start
+                + MINIMUM_NOTE_SECONDS
+            )
+
+    final_events: list[NoteEvent] = []
+
+    for event in events:
+        if (
+            final_events
+            and final_events[-1].end
+            > event.start
+        ):
+            final_events[-1].end = (
+                event.start - 0.005
+            )
+
+            if (
+                final_events[-1].duration
+                < MINIMUM_NOTE_SECONDS
+            ):
+                final_events.pop()
+
+        if (
+            event.duration
+            >= MINIMUM_NOTE_SECONDS
+        ):
+            final_events.append(event)
+
+    return final_events
+
+
+# =========================================================
+# VELOCITY
+# =========================================================
+
+def assign_note_velocities(
+    events: list[NoteEvent],
 ) -> None:
-    """
-    সব note একই volume না রেখে natural dynamics তৈরি করে।
-    """
+    if not events:
+        return
 
-    for index, note in enumerate(notes):
-        phrase_accent = (
-            7 if index % 4 == 0 else 0
+    energies = np.asarray(
+        [
+            max(
+                event.energy,
+                1e-9,
+            )
+            for event in events
+        ],
+        dtype=np.float64,
+    )
+
+    maximum_energy = max(
+        float(np.max(energies)),
+        1e-9,
+    )
+
+    energy_db = (
+        20.0
+        * np.log10(
+            energies / maximum_energy
+        )
+    )
+
+    lower_level, upper_level = (
+        np.percentile(
+            energy_db,
+            [
+                10,
+                90,
+            ],
+        )
+    )
+
+    if (
+        upper_level
+        - lower_level
+        < 1e-3
+    ):
+        upper_level = (
+            lower_level + 1.0
         )
 
-        duration_accent = min(
-            10,
-            int(
-                (note.end - note.start)
-                * 7
-            ),
+    for index, event in enumerate(
+        events
+    ):
+        normalized_level = (
+            energy_db[index]
+            - lower_level
+        ) / (
+            upper_level
+            - lower_level
         )
 
-        original_velocity = int(
-            (note.velocity - 64) * 0.18
-        )
-
-        final_velocity = (
-            76
-            + phrase_accent
-            + duration_accent
-            + original_velocity
-        )
-
-        note.velocity = int(
+        normalized_level = float(
             np.clip(
-                final_velocity,
+                normalized_level,
+                0.0,
+                1.0,
+            )
+        )
+
+        phrase_accent = (
+            5
+            if index % 4 == 0
+            else 0
+        )
+
+        confidence_adjustment = int(
+            np.clip(
+                (
+                    event.confidence
+                    - 0.5
+                ) * 20,
+                -5,
+                7,
+            )
+        )
+
+        event.velocity = int(
+            np.clip(
+                58
+                + normalized_level * 39
+                + phrase_accent
+                + confidence_adjustment,
                 48,
                 108,
             )
         )
 
 
-def add_sustain_pedal(
+# =========================================================
+# MIDI CREATION
+# =========================================================
+
+def add_piano_pedal(
     piano: pretty_midi.Instrument,
-    notes: list[pretty_midi.Note],
-    tempo: float,
+    events: list[NoteEvent],
 ) -> None:
-    if not notes:
+    if not events:
         return
 
-    beat_seconds = (
-        60.0 / max(tempo, 1.0)
-    )
+    phrase_start = events[0].start
+    phrase_end = events[0].end
 
-    pedal_duration = (
-        beat_seconds * 2.0
-    )
-
-    start_time = max(
-        0.0,
-        notes[0].start,
-    )
-
-    ending_time = notes[-1].end
-
-    while start_time < ending_time:
-        release_time = min(
-            start_time
-            + pedal_duration
-            - 0.04,
-            ending_time,
-        )
+    def write_pedal(
+        start_time: float,
+        end_time: float,
+    ) -> None:
+        if end_time <= start_time:
+            return
 
         piano.control_changes.append(
             pretty_midi.ControlChange(
                 number=64,
-                value=72,
-                time=start_time,
+                value=58,
+                time=max(
+                    0.0,
+                    start_time,
+                ),
             )
         )
 
@@ -904,92 +1740,112 @@ def add_sustain_pedal(
             pretty_midi.ControlChange(
                 number=64,
                 value=0,
-                time=release_time,
+                time=max(
+                    start_time + 0.03,
+                    end_time,
+                ),
             )
         )
 
-        start_time += pedal_duration
+    for index in range(
+        1,
+        len(events),
+    ):
+        previous = events[index - 1]
+        current = events[index]
 
+        gap = (
+            current.start
+            - previous.end
+        )
 
-def create_clean_piano_midi(
-    predicted_midi: pretty_midi.PrettyMIDI,
-    source_audio: Path,
-    output_midi: Path,
-) -> tuple[int, float]:
-    tempo = estimate_tempo(
-        source_audio
+        long_phrase = (
+            current.start
+            - phrase_start
+            > 2.6
+        )
+
+        if gap >= 0.18 or long_phrase:
+            pedal_end = min(
+                phrase_end + 0.05,
+                current.start - 0.025,
+            )
+
+            write_pedal(
+                phrase_start,
+                pedal_end,
+            )
+
+            phrase_start = (
+                current.start
+            )
+
+        phrase_end = current.end
+
+    write_pedal(
+        phrase_start,
+        phrase_end + 0.06,
     )
 
-    notes = collect_all_notes(
-        predicted_midi
-    )
 
-    notes = select_main_melody(
-        notes
-    )
-
-    repair_octave_errors(
-        notes
-    )
-
-    notes = merge_repeated_notes(
-        notes
-    )
-
-    quantize_notes(
-        notes,
-        tempo,
-    )
-
-    improve_piano_velocity(
-        notes
-    )
-
-    if not notes:
+def create_piano_midi(
+    events: list[NoteEvent],
+    tempo: float,
+    midi_path: Path,
+) -> None:
+    if len(events) < 2:
         raise PipelineError(
-            "কোনো usable melody note পাওয়া যায়নি। "
-            "আরও পরিষ্কার instrumental music ব্যবহার করো।"
+            "পরিষ্কার main melody পাওয়া যায়নি। "
+            "আরও স্পষ্ট lead melody-সহ "
+            "instrumental ব্যবহার করো।"
         )
 
-    output = pretty_midi.PrettyMIDI(
-        initial_tempo=tempo
-    )
-
-    piano_program = (
-        pretty_midi
-        .instrument_name_to_program(
-            "Acoustic Grand Piano"
-        )
+    midi = pretty_midi.PrettyMIDI(
+        initial_tempo=tempo,
     )
 
     piano = pretty_midi.Instrument(
-        program=piano_program,
+        program=0,
         is_drum=False,
-        name="TuneMorph Piano",
+        name="TuneMorph Solo Piano",
     )
 
-    piano.notes.extend(notes)
+    for event in events:
+        piano.notes.append(
+            pretty_midi.Note(
+                velocity=event.velocity,
+                pitch=event.pitch,
+                start=max(
+                    0.0,
+                    event.start,
+                ),
+                end=max(
+                    event.start
+                    + MINIMUM_NOTE_SECONDS,
+                    event.end,
+                ),
+            )
+        )
 
-    add_sustain_pedal(
+    add_piano_pedal(
         piano,
-        notes,
-        tempo,
+        events,
     )
 
-    output.instruments.append(piano)
-
-    output.write(
-        str(output_midi)
+    midi.instruments.append(
+        piano
     )
 
-    return len(notes), tempo
+    midi.write(
+        str(midi_path)
+    )
 
 
 # =========================================================
 # PIANO RENDERING
 # =========================================================
 
-def render_midi_to_wav(
+def render_piano_midi(
     midi_path: Path,
     wav_path: Path,
 ) -> None:
@@ -998,31 +1854,39 @@ def render_midi_to_wav(
         "FluidSynth",
     )
 
-    require_file(
-        PIANO_SF2,
-        "Piano SoundFont",
-    )
+    soundfont = find_soundfont()
+
+    if not soundfont.exists():
+        raise PipelineError(
+            "Piano SoundFont পাওয়া যায়নি। "
+            "এই folder-এ piano.sf2 রাখো: "
+            f"{SOUNDFONTS_DIR}"
+        )
 
     command = [
         fluidsynth,
+
         "-ni",
 
-        # Output volume।
-        "-g",
-        "0.78",
+        # Reverb on
+        "-R",
+        "1",
 
-        # Sample rate।
+        # Chorus off
+        "-C",
+        "0",
+
+        "-g",
+        "0.82",
+
         "-r",
         "44100",
 
-        # Output WAV।
         "-F",
         str(wav_path),
 
-        # SoundFont।
-        str(PIANO_SF2),
+        str(soundfont),
 
-        # MIDI file।
         str(midi_path),
     ]
 
@@ -1033,13 +1897,13 @@ def render_midi_to_wav(
 
 
 # =========================================================
-# AUDIO POST-PROCESSING
+# WAV + MP3 EXPORT
 # =========================================================
 
-def create_final_audio(
-    raw_wav: Path,
-    final_wav: Path,
-    final_mp3: Path,
+def export_final_audio(
+    raw_wav_path: Path,
+    final_wav_path: Path,
+    final_mp3_path: Path,
 ) -> None:
     ffmpeg = find_executable(
         FFMPEG_EXE,
@@ -1048,40 +1912,42 @@ def create_final_audio(
 
     audio_filter = (
         "highpass=f=28,"
-        "lowpass=f=17500,"
-        "loudnorm=I=-16:TP=-1.5:LRA=11"
+        "lowpass=f=18000,"
+        "loudnorm=I=-16:"
+        "TP=-1.5:"
+        "LRA=10"
     )
 
-    # Final WAV।
+    # 24-bit WAV
     run_command(
         [
             ffmpeg,
             "-y",
             "-i",
-            str(raw_wav),
+            str(raw_wav_path),
             "-af",
             audio_filter,
             "-c:a",
-            "pcm_s16le",
-            str(final_wav),
+            "pcm_s24le",
+            str(final_wav_path),
         ],
-        timeout=900,
+        timeout=1200,
     )
 
-    # Final MP3।
+    # 256 kbps MP3
     run_command(
         [
             ffmpeg,
             "-y",
             "-i",
-            str(final_wav),
+            str(final_wav_path),
             "-c:a",
             "libmp3lame",
             "-b:a",
             "256k",
-            str(final_mp3),
+            str(final_mp3_path),
         ],
-        timeout=900,
+        timeout=1200,
     )
 
 
@@ -1090,88 +1956,152 @@ def create_final_audio(
 # =========================================================
 
 def convert_music_to_piano(
-    uploaded_file: Path,
-    job_work_directory: Path,
+    uploaded_audio: Path,
+    working_directory: Path,
 ) -> dict:
-    normalized_audio = (
-        job_work_directory
-        / "normalized.wav"
-    )
+    with PIPELINE_LOCK:
+        normalized_audio = (
+            working_directory
+            / "normalized.wav"
+        )
 
-    normalize_audio(
-        uploaded_file,
-        normalized_audio,
-    )
-
-    instrumental_stem = (
-        separate_instrumental_music(
+        normalize_audio(
+            uploaded_audio,
             normalized_audio,
-            job_work_directory
+        )
+
+        other_stem = separate_music(
+            normalized_audio,
+            working_directory
             / "separated",
         )
-    )
 
-    predicted_midi = transcribe_music(
-        instrumental_stem
-    )
-
-    piano_midi = (
-        job_work_directory
-        / "piano.mid"
-    )
-
-    note_count, tempo = (
-        create_clean_piano_midi(
-            predicted_midi,
-            instrumental_stem,
-            piano_midi,
+        (
+            original_audio,
+            pitch_audio,
+            sample_rate,
+        ) = prepare_pitch_audio(
+            other_stem
         )
-    )
 
-    raw_wav = (
-        job_work_directory
-        / "piano_raw.wav"
-    )
+        pitch_hz, periodicity = (
+            track_pitch(
+                pitch_audio,
+                sample_rate,
+            )
+        )
 
-    final_wav = (
-        job_work_directory
-        / "piano.wav"
-    )
+        frame_count = min(
+            len(pitch_hz),
+            len(periodicity),
+        )
 
-    final_mp3 = (
-        job_work_directory
-        / "piano.mp3"
-    )
+        pitch_hz = pitch_hz[
+            :frame_count
+        ]
 
-    render_midi_to_wav(
-        piano_midi,
-        raw_wav,
-    )
+        periodicity = periodicity[
+            :frame_count
+        ]
 
-    create_final_audio(
-        raw_wav,
-        final_wav,
-        final_mp3,
-    )
+        (
+            rms,
+            onset_envelope,
+            beat_frames,
+            tempo,
+        ) = calculate_frame_features(
+            original_audio,
+            sample_rate,
+            frame_count,
+        )
 
-    return {
-        "midi": piano_midi,
-        "wav": final_wav,
-        "mp3": final_mp3,
-        "note_count": note_count,
-        "tempo": tempo,
-    }
+        midi_pitch = frequency_to_midi(
+            pitch_hz
+        )
+
+        labels = smooth_pitch_labels(
+            midi_pitch,
+            periodicity,
+        )
+
+        events = labels_to_note_events(
+            labels,
+            midi_pitch,
+            periodicity,
+            rms,
+            onset_envelope,
+        )
+
+        events = clean_note_events(
+            events
+        )
+
+        events = quantize_note_events(
+            events,
+            beat_frames,
+            tempo,
+        )
+
+        assign_note_velocities(
+            events
+        )
+
+        midi_path = (
+            working_directory
+            / "piano.mid"
+        )
+
+        raw_wav_path = (
+            working_directory
+            / "piano_raw.wav"
+        )
+
+        final_wav_path = (
+            working_directory
+            / "piano.wav"
+        )
+
+        final_mp3_path = (
+            working_directory
+            / "piano.mp3"
+        )
+
+        create_piano_midi(
+            events,
+            tempo,
+            midi_path,
+        )
+
+        render_piano_midi(
+            midi_path,
+            raw_wav_path,
+        )
+
+        export_final_audio(
+            raw_wav_path,
+            final_wav_path,
+            final_mp3_path,
+        )
+
+        return {
+            "midi": midi_path,
+            "wav": final_wav_path,
+            "mp3": final_mp3_path,
+            "note_count": len(events),
+            "tempo": tempo,
+        }
 
 
 # =========================================================
-# ROUTES
+# API ROUTES
 # =========================================================
 
 @app.get("/")
 def root() -> dict:
     return {
         "message": (
-            "TuneMorph Piano API is running."
+            "TuneMorph Piano API "
+            "is running."
         ),
         "docs": "/docs",
     }
@@ -1179,21 +2109,52 @@ def root() -> dict:
 
 @app.get("/api/health")
 def health() -> dict:
+    soundfont = find_soundfont()
+
     return {
         "ok": True,
-        "fluidsynth_found": (
-            FLUIDSYNTH_EXE.exists()
-        ),
-        "piano_soundfont_found": (
-            PIANO_SF2.exists()
-        ),
+
         "ffmpeg_found": (
             shutil.which(
                 FFMPEG_EXE
             )
             is not None
+            or Path(
+                FFMPEG_EXE
+            ).exists()
         ),
-        "demucs_model": DEMUCS_MODEL,
+
+        "fluidsynth_found": (
+            FLUIDSYNTH_EXE.exists()
+        ),
+
+        "soundfont_found": (
+            soundfont.exists()
+        ),
+
+        "soundfont": str(
+            soundfont
+        ),
+
+        "demucs_found": (
+            importlib.util.find_spec(
+                "demucs"
+            )
+            is not None
+        ),
+
+        "torchcrepe_found": (
+            torchcrepe is not None
+        ),
+
+        "cuda_available": bool(
+            torch is not None
+            and torch.cuda.is_available()
+        ),
+
+        "demucs_model": (
+            DEMUCS_MODEL
+        ),
     }
 
 
@@ -1201,6 +2162,8 @@ def health() -> dict:
 async def convert(
     file: UploadFile = File(...),
 ) -> dict:
+    cleanup_old_outputs()
+
     filename = safe_filename(
         file.filename
     )
@@ -1211,7 +2174,10 @@ async def convert(
         .lower()
     )
 
-    if extension not in ALLOWED_EXTENSIONS:
+    if (
+        extension
+        not in ALLOWED_EXTENSIONS
+    ):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -1228,15 +2194,18 @@ async def convert(
     job_id = uuid.uuid4().hex
 
     upload_directory = (
-        UPLOADS_DIR / job_id
+        UPLOADS_DIR
+        / job_id
     )
 
     work_directory = (
-        WORK_DIR / job_id
+        WORK_DIR
+        / job_id
     )
 
     output_directory = (
-        OUTPUTS_DIR / job_id
+        OUTPUTS_DIR
+        / job_id
     )
 
     upload_directory.mkdir(
@@ -1254,8 +2223,9 @@ async def convert(
         exist_ok=False,
     )
 
-    uploaded_path = (
-        upload_directory / filename
+    upload_path = (
+        upload_directory
+        / filename
     )
 
     try:
@@ -1265,11 +2235,11 @@ async def convert(
             * 1024
         )
 
-        total_bytes = 0
+        uploaded_bytes = 0
 
-        with uploaded_path.open(
+        with upload_path.open(
             "wb"
-        ) as output_file:
+        ) as destination:
             while True:
                 chunk = await file.read(
                     1024 * 1024
@@ -1278,22 +2248,29 @@ async def convert(
                 if not chunk:
                     break
 
-                total_bytes += len(chunk)
+                uploaded_bytes += len(
+                    chunk
+                )
 
-                if total_bytes > maximum_bytes:
+                if (
+                    uploaded_bytes
+                    > maximum_bytes
+                ):
                     raise HTTPException(
                         status_code=413,
                         detail=(
-                            f"File must be smaller "
+                            "File must be smaller "
                             f"than {MAX_UPLOAD_MB} MB."
                         ),
                     )
 
-                output_file.write(chunk)
+                destination.write(
+                    chunk
+                )
 
         result = await run_in_threadpool(
             convert_music_to_piano,
-            uploaded_path,
+            upload_path,
             work_directory,
         )
 
@@ -1329,22 +2306,30 @@ async def convert(
 
         return {
             "ok": True,
+
             "job_id": job_id,
+
             "note_count": (
                 result["note_count"]
             ),
+
             "estimated_tempo": round(
-                float(result["tempo"]),
+                float(
+                    result["tempo"]
+                ),
                 2,
             ),
+
             "audio_url": (
                 f"/api/output/"
                 f"{job_id}/piano.mp3"
             ),
+
             "wav_url": (
                 f"/api/output/"
                 f"{job_id}/piano.wav"
             ),
+
             "midi_url": (
                 f"/api/output/"
                 f"{job_id}/piano.mid"
@@ -1379,7 +2364,8 @@ async def convert(
         raise HTTPException(
             status_code=500,
             detail=(
-                f"Conversion failed: {error}"
+                "Conversion failed: "
+                f"{error}"
             ),
         ) from error
 
@@ -1436,13 +2422,11 @@ def get_output_file(
         / job_id
     ).resolve()
 
-    if output_path.parent != expected_parent:
-        raise HTTPException(
-            status_code=404,
-            detail="File not found.",
-        )
-
-    if not output_path.exists():
+    if (
+        output_path.parent
+        != expected_parent
+        or not output_path.exists()
+    ):
         raise HTTPException(
             status_code=404,
             detail="File not found.",

@@ -84,20 +84,20 @@ function App() {
 
       <main className="app-page">
         <section className="hero">
-          <div className="logo">♫</div>
+          {/* <div className="logo">♫</div>
 
           <p className="brand-name">
             The Piano
-          </p>
+          </p> */}
 
-          <h1>
+          {/* <h1>
             Turn your music into piano.
           </h1>
 
           <p className="subtitle">
             Music upload করো। The Piano মূল melody খুঁজে
             সেটিকে solo piano হিসেবে তৈরি করবে।
-          </p>
+          </p> */}
         </section>
 
         <section className="converter-card">
