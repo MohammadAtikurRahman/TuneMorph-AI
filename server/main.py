@@ -1,41 +1,42 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from __future__ import annotations
 
+import math
 import os
-import uuid
+import re
 import shutil
 import subprocess
+import sys
+import uuid
 from pathlib import Path
 
+import librosa
+import numpy as np
 import pretty_midi
-
-from basic_pitch.inference import predict_and_save
 from basic_pitch import ICASSP_2022_MODEL_PATH
+from basic_pitch.inference import predict
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from starlette.concurrency import run_in_threadpool
 
 
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# =========================================================
+# PATH CONFIGURATION
+# =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 
-UPLOAD_DIR = BASE_DIR / "uploads"
-OUTPUT_DIR = BASE_DIR / "outputs"
-SOUNDFONT_DIR = BASE_DIR / "soundfonts"
+UPLOADS_DIR = BASE_DIR / "uploads"
+OUTPUTS_DIR = BASE_DIR / "outputs"
+WORK_DIR = BASE_DIR / "work"
 
-UPLOAD_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR.mkdir(exist_ok=True)
-SOUNDFONT_DIR.mkdir(exist_ok=True)
+for directory in (
+    UPLOADS_DIR,
+    OUTPUTS_DIR,
+    WORK_DIR,
+):
+    directory.mkdir(parents=True, exist_ok=True)
+
 
 FLUIDSYNTH_EXE = (
     BASE_DIR
@@ -45,872 +46,1418 @@ FLUIDSYNTH_EXE = (
     / "fluidsynth.exe"
 )
 
-DEFAULT_SOUNDFONT_PATH = SOUNDFONT_DIR / "FluidR3_GM.sf2"
+PIANO_SF2 = BASE_DIR / "soundfonts" / "piano.sf2"
 
-ALLOWED_INSTRUMENTS = ["guitar", "piano", "flute", "violin"]
+# piano.sf2 না থাকলে এই SoundFont ব্যবহার করবে।
+if not PIANO_SF2.exists():
+    fallback_soundfont = (
+        BASE_DIR
+        / "soundfonts"
+        / "FluidR3_GM.sf2"
+    )
+
+    if fallback_soundfont.exists():
+        PIANO_SF2 = fallback_soundfont
 
 
-@app.get("/")
-def home():
-    return {
-        "message": "TuneMorph backend is running",
-        "status": "ok",
-        "mode": "audio-convert-only"
-    }
+FFMPEG_EXE = "ffmpeg"
+DEMUCS_MODEL = "htdemucs"
+MAX_UPLOAD_MB = 100
 
 
-def get_soundfont_path(instrument_name: str):
-    instrument_name = instrument_name.lower().strip()
+ALLOWED_EXTENSIONS = {
+    ".mp3",
+    ".wav",
+    ".flac",
+    ".ogg",
+    ".m4a",
+    ".aac",
+    ".wma",
+}
 
-    specific_soundfonts = {
-        "guitar": "guitar.sf2",
-        "piano": "piano.sf2",
-        "flute": "flute.sf2",
-        "violin": "violin.sf2",
-    }
 
-    file_name = specific_soundfonts.get(instrument_name)
-    specific_path = SOUNDFONT_DIR / file_name if file_name else None
+# =========================================================
+# FASTAPI
+# =========================================================
 
-    if specific_path and specific_path.exists():
-        return specific_path, True
+app = FastAPI(
+    title="TuneMorph Piano API",
+    version="1.0.0",
+)
 
-    if DEFAULT_SOUNDFONT_PATH.exists():
-        return DEFAULT_SOUNDFONT_PATH, False
 
-    raise Exception(
-        "No SoundFont found. Put guitar.sf2, piano.sf2, flute.sf2, violin.sf2 or FluidR3_GM.sf2 inside server/soundfonts/"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# =========================================================
+# ERROR CLASS
+# =========================================================
+
+class PipelineError(RuntimeError):
+    pass
+
+
+# =========================================================
+# GENERAL HELPERS
+# =========================================================
+
+def find_executable(
+    executable: str | Path,
+    label: str,
+) -> str:
+    path = Path(executable)
+
+    if path.exists() and path.is_file():
+        return str(path.resolve())
+
+    found = shutil.which(str(executable))
+
+    if found:
+        return found
+
+    raise PipelineError(
+        f"{label} পাওয়া যায়নি: {executable}"
     )
 
 
-def get_instrument_program(instrument_name: str, using_specific_soundfont: bool) -> int:
-    instrument_name = instrument_name.lower().strip()
-
-    # Custom single-instrument sf2 হলে program 0
-    if using_specific_soundfont:
-        return 0
-
-    # FluidR3_GM fallback হলে GM program
-    program_map = {
-        "guitar": "Acoustic Guitar (steel)",
-        "piano": "Acoustic Grand Piano",
-        "flute": "Flute",
-        "violin": "Violin",
-    }
-
-    gm_name = program_map.get(instrument_name, "Acoustic Grand Piano")
-
-    try:
-        return pretty_midi.instrument_name_to_program(gm_name)
-    except Exception:
-        return pretty_midi.instrument_name_to_program("Acoustic Grand Piano")
+def require_file(
+    path: Path,
+    label: str,
+) -> None:
+    if not path.exists() or not path.is_file():
+        raise PipelineError(
+            f"{label} পাওয়া যায়নি: {path}"
+        )
 
 
-def merge_non_drum_instruments(midi_data: pretty_midi.PrettyMIDI):
-    """
-    Basic Pitch sometimes multiple tracks বানায়।
-    সব non-drum note এক track-এ রাখলে render cleaner হয়।
-    """
-    merged = pretty_midi.PrettyMIDI()
-    main_instrument = pretty_midi.Instrument(program=0, name="TuneMorph Main")
-
-    all_notes = []
-
-    for midi_instrument in midi_data.instruments:
-        if midi_instrument.is_drum:
-            continue
-
-        for note in midi_instrument.notes:
-            all_notes.append(
-                pretty_midi.Note(
-                    velocity=note.velocity,
-                    pitch=note.pitch,
-                    start=note.start,
-                    end=note.end,
-                )
-            )
-
-    all_notes.sort(key=lambda n: (n.start, n.pitch))
-    main_instrument.notes = all_notes
-    merged.instruments.append(main_instrument)
-
-    return merged
-
-
-def remove_bad_notes(midi_data: pretty_midi.PrettyMIDI, instrument_name: str):
-    """
-    Tiny/wrong notes remove করে।
-    খুব aggressive না, যাতে melody নষ্ট না হয়।
-    """
-    instrument_name = instrument_name.lower().strip()
-
-    min_duration_map = {
-        "piano": 0.075,
-        "guitar": 0.085,
-        "flute": 0.105,
-        "violin": 0.105,
-    }
-
-    min_duration = min_duration_map.get(instrument_name, 0.085)
-
-    for midi_instrument in midi_data.instruments:
-        if midi_instrument.is_drum:
-            continue
-
-        cleaned_notes = []
-
-        for note in midi_instrument.notes:
-            duration = note.end - note.start
-
-            if duration < min_duration:
-                continue
-
-            if note.velocity < 25:
-                continue
-
-            note.velocity = max(35, min(115, note.velocity))
-            cleaned_notes.append(note)
-
-        cleaned_notes.sort(key=lambda n: (n.start, n.pitch))
-        midi_instrument.notes = cleaned_notes
-
-    return midi_data
-
-
-def fix_note_range(midi_data: pretty_midi.PrettyMIDI, instrument_name: str):
-    """
-    Instrument natural range-এর বাইরে গেলে octave shift করে।
-    """
-    instrument_name = instrument_name.lower().strip()
-
-    ranges = {
-        "guitar": (40, 88),   # E2 to E6
-        "piano": (24, 103),
-        "flute": (60, 96),    # C4 to C7
-        "violin": (55, 100),  # G3 to E7
-    }
-
-    low, high = ranges.get(instrument_name, (24, 103))
-
-    for midi_instrument in midi_data.instruments:
-        if midi_instrument.is_drum:
-            continue
-
-        for note in midi_instrument.notes:
-            while note.pitch < low:
-                note.pitch += 12
-
-            while note.pitch > high:
-                note.pitch -= 12
-
-            note.pitch = max(0, min(127, note.pitch))
-
-    return midi_data
-
-
-def smooth_velocity(midi_data: pretty_midi.PrettyMIDI, instrument_name: str):
-    """
-    Uneven loud/soft note balance করে।
-    """
-    instrument_name = instrument_name.lower().strip()
-
-    velocity_settings = {
-        "piano": (45, 105, 76, 0.65),
-        "guitar": (42, 94, 68, 0.60),
-        "flute": (54, 90, 72, 0.55),
-        "violin": (44, 88, 66, 0.55),
-    }
-
-    min_v, max_v, center_v, strength = velocity_settings.get(
-        instrument_name,
-        (45, 100, 72, 0.60)
+def run_command(
+    command: list[str],
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.run(
+        command,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
     )
 
-    for midi_instrument in midi_data.instruments:
-        if midi_instrument.is_drum:
-            continue
-
-        for note in midi_instrument.notes:
-            note.velocity = int(center_v + (note.velocity - center_v) * strength)
-            note.velocity = max(min_v, min(max_v, note.velocity))
-
-    return midi_data
-
-
-def merge_repeated_notes(midi_data: pretty_midi.PrettyMIDI, instrument_name: str):
-    """
-    Same pitch repeated tiny shaky notes merge করে।
-    """
-    instrument_name = instrument_name.lower().strip()
-
-    max_gap_map = {
-        "piano": 0.040,
-        "guitar": 0.050,
-        "flute": 0.080,
-        "violin": 0.080,
-    }
-
-    max_gap = max_gap_map.get(instrument_name, 0.055)
-
-    for midi_instrument in midi_data.instruments:
-        if midi_instrument.is_drum:
-            continue
-
-        notes = sorted(midi_instrument.notes, key=lambda n: (n.pitch, n.start))
-        merged_notes = []
-        used = [False] * len(notes)
-
-        for i, note in enumerate(notes):
-            if used[i]:
-                continue
-
-            current = note
-            used[i] = True
-
-            for j in range(i + 1, len(notes)):
-                other = notes[j]
-
-                if used[j]:
-                    continue
-
-                if other.pitch != current.pitch:
-                    break
-
-                gap = other.start - current.end
-
-                if 0 <= gap <= max_gap:
-                    current.end = max(current.end, other.end)
-                    current.velocity = max(current.velocity, other.velocity)
-                    used[j] = True
-                elif other.start > current.end + max_gap:
-                    break
-
-            merged_notes.append(current)
-
-        merged_notes.sort(key=lambda n: (n.start, n.pitch))
-        midi_instrument.notes = merged_notes
-
-    return midi_data
-
-
-def reduce_polyphony(midi_data: pretty_midi.PrettyMIDI, instrument_name: str):
-    """
-    Basic Pitch full audio থেকে অনেক extra note তুললে amateur লাগে।
-    Piano/Guitar-এ limited polyphony রাখে।
-    Flute/Violin monophonic হবে।
-    """
-    instrument_name = instrument_name.lower().strip()
-
-    if instrument_name in ["flute", "violin"]:
-        return midi_data
-
-    max_notes_map = {
-        "piano": 4,
-        "guitar": 3,
-    }
-
-    max_notes = max_notes_map.get(instrument_name, 4)
-    group_window = 0.045
-
-    for midi_instrument in midi_data.instruments:
-        if midi_instrument.is_drum:
-            continue
-
-        notes = sorted(midi_instrument.notes, key=lambda n: (n.start, n.pitch))
-
-        if not notes:
-            continue
-
-        groups = []
-        current_group = [notes[0]]
-        group_start = notes[0].start
-
-        for note in notes[1:]:
-            if abs(note.start - group_start) <= group_window:
-                current_group.append(note)
-            else:
-                groups.append(current_group)
-                current_group = [note]
-                group_start = note.start
-
-        groups.append(current_group)
-
-        selected_notes = []
-
-        for group in groups:
-            if len(group) <= max_notes:
-                selected_notes.extend(group)
-            else:
-                ranked = sorted(
-                    group,
-                    key=lambda n: (
-                        n.velocity * 1.2
-                        + (n.end - n.start) * 20
-                        + n.pitch * 0.08
-                    ),
-                    reverse=True,
-                )
-                selected_notes.extend(ranked[:max_notes])
-
-        selected_notes.sort(key=lambda n: (n.start, n.pitch))
-        midi_instrument.notes = selected_notes
-
-    return midi_data
-
-
-def make_monophonic_for_lead(midi_data: pretty_midi.PrettyMIDI, instrument_name: str):
-    """
-    Flute/Violin lead instrument.
-    একসাথে অনেক note বাজলে বাজে লাগে, তাই main melody রাখে।
-    """
-    instrument_name = instrument_name.lower().strip()
-
-    if instrument_name not in ["flute", "violin"]:
-        return midi_data
-
-    group_window = 0.060
-
-    for midi_instrument in midi_data.instruments:
-        if midi_instrument.is_drum:
-            continue
-
-        notes = sorted(midi_instrument.notes, key=lambda n: (n.start, n.pitch))
-
-        if not notes:
-            continue
-
-        groups = []
-        current_group = [notes[0]]
-        group_start = notes[0].start
-
-        for note in notes[1:]:
-            if abs(note.start - group_start) <= group_window:
-                current_group.append(note)
-            else:
-                groups.append(current_group)
-                current_group = [note]
-                group_start = note.start
-
-        groups.append(current_group)
-
-        melody_notes = []
-        previous_pitch = None
-
-        for group in groups:
-            if previous_pitch is None:
-                best_note = max(
-                    group,
-                    key=lambda n: (
-                        n.velocity * 1.10
-                        + (n.end - n.start) * 18
-                        + n.pitch * 0.40
-                    )
-                )
-            else:
-                best_note = max(
-                    group,
-                    key=lambda n: (
-                        n.velocity * 1.10
-                        + (n.end - n.start) * 18
-                        + n.pitch * 0.35
-                        - abs(n.pitch - previous_pitch) * 0.85
-                    )
-                )
-
-            melody_notes.append(best_note)
-            previous_pitch = best_note.pitch
-
-        melody_notes.sort(key=lambda n: n.start)
-
-        filtered_notes = []
-
-        for note in melody_notes:
-            if not filtered_notes:
-                filtered_notes.append(note)
-                continue
-
-            prev = filtered_notes[-1]
-            interval = abs(note.pitch - prev.pitch)
-            duration = note.end - note.start
-
-            # Huge random short jump skip
-            if interval > 15 and duration < 0.18:
-                continue
-
-            filtered_notes.append(note)
-
-        # Overlap clean
-        for i in range(len(filtered_notes) - 1):
-            current_note = filtered_notes[i]
-            next_note = filtered_notes[i + 1]
-
-            if current_note.end > next_note.start - 0.012:
-                current_note.end = max(
-                    current_note.start + 0.13,
-                    next_note.start - 0.012
-                )
-
-        midi_instrument.notes = filtered_notes
-
-    return midi_data
-
-
-def remove_too_fast_notes(midi_data: pretty_midi.PrettyMIDI, instrument_name: str):
-    """
-    Too fast shaky weak notes remove করে।
-    """
-    instrument_name = instrument_name.lower().strip()
-
-    min_start_gap_map = {
-        "piano": 0.030,
-        "guitar": 0.040,
-        "flute": 0.060,
-        "violin": 0.060,
-    }
-
-    min_start_gap = min_start_gap_map.get(instrument_name, 0.045)
-
-    for midi_instrument in midi_data.instruments:
-        if midi_instrument.is_drum:
-            continue
-
-        notes = sorted(midi_instrument.notes, key=lambda n: n.start)
-        filtered = []
-
-        for note in notes:
-            if not filtered:
-                filtered.append(note)
-                continue
-
-            prev = filtered[-1]
-
-            if note.start - prev.start < min_start_gap:
-                note_score = note.velocity + (note.end - note.start) * 35
-                prev_score = prev.velocity + (prev.end - prev.start) * 35
-
-                if note_score > prev_score + 12:
-                    filtered[-1] = note
-
-                continue
-
-            filtered.append(note)
-
-        filtered.sort(key=lambda n: (n.start, n.pitch))
-        midi_instrument.notes = filtered
-
-    return midi_data
-
-
-def apply_instrument_style(midi_data: pretty_midi.PrettyMIDI, instrument_name: str):
-    """
-    Instrument অনুযায়ী note length adjust.
-    """
-    instrument_name = instrument_name.lower().strip()
-
-    for midi_instrument in midi_data.instruments:
-        if midi_instrument.is_drum:
-            continue
-
-        notes = sorted(midi_instrument.notes, key=lambda n: n.start)
-
-        for note in notes:
-            duration = note.end - note.start
-
-            if instrument_name == "guitar":
-                new_duration = duration * 0.72
-                new_duration = max(0.12, min(1.05, new_duration))
-                note.end = note.start + new_duration
-
-            elif instrument_name == "piano":
-                new_duration = duration * 1.03
-                new_duration = max(0.13, min(2.30, new_duration))
-                note.end = note.start + new_duration
-
-            elif instrument_name == "flute":
-                new_duration = duration * 1.08
-                new_duration = max(0.18, min(1.80, new_duration))
-                note.end = note.start + new_duration
-
-            elif instrument_name == "violin":
-                new_duration = duration * 1.07
-                new_duration = max(0.17, min(1.70, new_duration))
-                note.end = note.start + new_duration
-
-        if instrument_name in ["flute", "violin"]:
-            for i in range(len(notes) - 1):
-                if notes[i].end > notes[i + 1].start - 0.010:
-                    notes[i].end = max(
-                        notes[i].start + 0.12,
-                        notes[i + 1].start - 0.010
-                    )
-
-        midi_instrument.notes = notes
-
-    return midi_data
-
-
-def add_expression_controls(midi_data: pretty_midi.PrettyMIDI, instrument_name: str):
-    """
-    MIDI volume/expression/reverb/chorus control.
-    """
-    instrument_name = instrument_name.lower().strip()
-
-    settings = {
-        "piano": {"volume": 100, "expression": 105, "reverb": 34, "chorus": 5},
-        "guitar": {"volume": 104, "expression": 104, "reverb": 30, "chorus": 7},
-        "flute": {"volume": 101, "expression": 108, "reverb": 44, "chorus": 6},
-        "violin": {"volume": 98, "expression": 107, "reverb": 42, "chorus": 6},
-    }
-
-    s = settings.get(
-        instrument_name,
-        {"volume": 100, "expression": 105, "reverb": 36, "chorus": 5}
+    if process.returncode != 0:
+        error_message = (
+            process.stderr.strip()
+            or process.stdout.strip()
+            or "External command failed."
+        )
+
+        raise PipelineError(error_message)
+
+    return process
+
+
+def safe_filename(
+    filename: str | None,
+) -> str:
+    original_name = filename or "music.wav"
+
+    cleaned_name = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "_",
+        original_name,
     )
 
-    for midi_instrument in midi_data.instruments:
-        if midi_instrument.is_drum:
-            continue
+    cleaned_name = cleaned_name.strip("._")
 
-        midi_instrument.control_changes.append(
-            pretty_midi.ControlChange(number=7, value=s["volume"], time=0)
-        )
-        midi_instrument.control_changes.append(
-            pretty_midi.ControlChange(number=11, value=s["expression"], time=0)
-        )
-        midi_instrument.control_changes.append(
-            pretty_midi.ControlChange(number=91, value=s["reverb"], time=0)
-        )
-        midi_instrument.control_changes.append(
-            pretty_midi.ControlChange(number=93, value=s["chorus"], time=0)
-        )
-
-    return midi_data
+    return cleaned_name or "music.wav"
 
 
-def prepare_midi_for_instrument(
-    midi_path: Path,
-    prepared_midi_path: Path,
-    instrument_name: str,
-    selected_program: int
-):
-    """
-    Audio থেকে Basic Pitch MIDI আসার পর clean + instrument styling.
-    """
-    midi_data = pretty_midi.PrettyMIDI(str(midi_path))
+# =========================================================
+# AUDIO NORMALIZATION
+# =========================================================
 
-    midi_data = merge_non_drum_instruments(midi_data)
-    midi_data = remove_bad_notes(midi_data, instrument_name)
-    midi_data = fix_note_range(midi_data, instrument_name)
-    midi_data = smooth_velocity(midi_data, instrument_name)
-    midi_data = merge_repeated_notes(midi_data, instrument_name)
-    midi_data = reduce_polyphony(midi_data, instrument_name)
-    midi_data = make_monophonic_for_lead(midi_data, instrument_name)
-    midi_data = remove_too_fast_notes(midi_data, instrument_name)
-    midi_data = apply_instrument_style(midi_data, instrument_name)
-    midi_data = add_expression_controls(midi_data, instrument_name)
-
-    for midi_instrument in midi_data.instruments:
-        if not midi_instrument.is_drum:
-            midi_instrument.program = selected_program
-            midi_instrument.notes.sort(key=lambda n: (n.start, n.pitch))
-
-    midi_data.write(str(prepared_midi_path))
-
-
-def render_midi_to_wav(midi_path: Path, wav_path: Path, instrument: str):
-    if not FLUIDSYNTH_EXE.exists():
-        raise Exception(f"FluidSynth not found: {FLUIDSYNTH_EXE}")
-
-    soundfont_path, using_specific_soundfont = get_soundfont_path(instrument)
-
-    if not soundfont_path.exists():
-        raise Exception(f"SoundFont not found: {soundfont_path}")
-
-    selected_program = get_instrument_program(
-        instrument,
-        using_specific_soundfont
-    )
-
-    print("Using SoundFont:", soundfont_path)
-    print("Specific SoundFont:", using_specific_soundfont)
-    print("Selected MIDI program:", selected_program)
-
-    prepared_midi_path = midi_path.with_name(f"prepared-{instrument}.mid")
-
-    prepare_midi_for_instrument(
-        midi_path=midi_path,
-        prepared_midi_path=prepared_midi_path,
-        instrument_name=instrument,
-        selected_program=selected_program
+def normalize_audio(
+    input_path: Path,
+    output_path: Path,
+) -> None:
+    ffmpeg = find_executable(
+        FFMPEG_EXE,
+        "FFmpeg",
     )
 
     command = [
-        str(FLUIDSYNTH_EXE),
-        "-ni",
-        "-a",
-        "file",
-        "-F",
-        str(wav_path),
-        "-T",
-        "wav",
-        "-r",
+        ffmpeg,
+        "-y",
+        "-i",
+        str(input_path),
+        "-vn",
+        "-ac",
+        "2",
+        "-ar",
         "44100",
-        str(soundfont_path),
-        str(prepared_midi_path),
+        "-c:a",
+        "pcm_s16le",
+        str(output_path),
     ]
 
-    print("Running FluidSynth command:")
-    print(" ".join(command))
-
-    result = subprocess.run(
+    run_command(
         command,
-        capture_output=True,
-        text=True
+        timeout=900,
     )
 
-    if result.returncode != 0:
-        raise Exception(
-            f"FluidSynth failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
+
+# =========================================================
+# DEMUCS SEPARATION
+# =========================================================
+
+def get_demucs_device() -> str:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+
+    except Exception:
+        pass
+
+    return "cpu"
+
+
+def separate_instrumental_music(
+    input_audio: Path,
+    separation_directory: Path,
+) -> Path:
+    """
+    Full music থেকে vocals, drums, bass এবং other stem আলাদা করে।
+
+    আমরা piano melody extraction-এর জন্য other.wav ব্যবহার করি।
+    """
+
+    device = get_demucs_device()
+
+    command = [
+        sys.executable,
+        "-m",
+        "demucs",
+        "-n",
+        DEMUCS_MODEL,
+        "-d",
+        device,
+        "--segment",
+        "7",
+        "--overlap",
+        "0.25",
+        "-j",
+        "1",
+        "-o",
+        str(separation_directory),
+        str(input_audio),
+    ]
+
+    try:
+        run_command(
+            command,
+            timeout=3600,
         )
 
-    if not wav_path.exists():
-        raise Exception("WAV file was not created by FluidSynth.")
+    except PipelineError:
+        # GPU error হলে CPU দিয়ে আবার চেষ্টা করবে।
+        if device != "cuda":
+            raise
+
+        device_index = command.index("-d") + 1
+        command[device_index] = "cpu"
+
+        run_command(
+            command,
+            timeout=7200,
+        )
+
+    output_folder = (
+        separation_directory
+        / DEMUCS_MODEL
+        / input_audio.stem
+    )
+
+    if not output_folder.exists():
+        raise PipelineError(
+            f"Demucs output folder পাওয়া যায়নি: "
+            f"{output_folder}"
+        )
+
+    other_stem = output_folder / "other.wav"
+
+    if not other_stem.exists():
+        raise PipelineError(
+            "Demucs other.wav stem তৈরি করেনি।"
+        )
+
+    return other_stem
 
 
-def normalize_audio(audio, target_peak=0.88):
-    import numpy as np
+# =========================================================
+# TEMPO DETECTION
+# =========================================================
 
-    audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+def estimate_tempo(
+    audio_path: Path,
+) -> float:
+    try:
+        audio, sample_rate = librosa.load(
+            str(audio_path),
+            sr=22050,
+            mono=True,
+        )
 
-    peak = float(np.max(np.abs(audio)))
+        if audio.size == 0:
+            return 120.0
 
-    if peak > 0.00001:
-        audio = audio * (target_peak / peak)
+        tempo, _ = librosa.beat.beat_track(
+            y=audio,
+            sr=sample_rate,
+        )
 
-    audio = np.clip(audio, -0.98, 0.98)
+        tempo_value = float(
+            np.asarray(tempo).reshape(-1)[0]
+        )
 
-    return audio
+        if not np.isfinite(tempo_value):
+            return 120.0
+
+        if tempo_value < 45:
+            return 120.0
+
+        if tempo_value > 220:
+            return 120.0
+
+        return tempo_value
+
+    except Exception:
+        return 120.0
 
 
-def get_polish_settings(instrument_name: str):
-    instrument_name = instrument_name.lower().strip()
+# =========================================================
+# BASIC PITCH TRANSCRIPTION
+# =========================================================
 
-    settings = {
-        "piano": {
-            "highpass": 35,
-            "lowpass": 14500,
-            "reverb_room": 0.18,
-            "reverb_wet": 0.050,
-            "compressor_threshold": -20,
-            "compressor_ratio": 1.7,
-            "target_peak": 0.88,
-        },
-        "guitar": {
-            "highpass": 55,
-            "lowpass": 12500,
-            "reverb_room": 0.16,
-            "reverb_wet": 0.045,
-            "compressor_threshold": -21,
-            "compressor_ratio": 2.0,
-            "target_peak": 0.87,
-        },
-        "flute": {
-            "highpass": 105,
-            "lowpass": 15000,
-            "reverb_room": 0.26,
-            "reverb_wet": 0.070,
-            "compressor_threshold": -22,
-            "compressor_ratio": 1.6,
-            "target_peak": 0.87,
-        },
-        "violin": {
-            "highpass": 80,
-            "lowpass": 13500,
-            "reverb_room": 0.24,
-            "reverb_wet": 0.065,
-            "compressor_threshold": -22,
-            "compressor_ratio": 1.7,
-            "target_peak": 0.86,
-        },
+def transcribe_music(
+    audio_path: Path,
+) -> pretty_midi.PrettyMIDI:
+    """
+    Audio থেকে MIDI notes detect করে।
+    """
+
+    _, midi_data, _ = predict(
+        audio_path,
+        ICASSP_2022_MODEL_PATH,
+
+        # বেশি false note আটকানোর জন্য।
+        onset_threshold=0.58,
+        frame_threshold=0.34,
+
+        # খুব ছোট accidental note বাদ দেওয়ার জন্য।
+        minimum_note_length=110.0,
+
+        # C2 থেকে C7 range।
+        minimum_frequency=float(
+            librosa.note_to_hz("C2")
+        ),
+        maximum_frequency=float(
+            librosa.note_to_hz("C7")
+        ),
+
+        multiple_pitch_bends=False,
+        melodia_trick=True,
+    )
+
+    return midi_data
+
+
+# =========================================================
+# MIDI CLEANING
+# =========================================================
+
+def copy_note(
+    note: pretty_midi.Note,
+) -> pretty_midi.Note:
+    return pretty_midi.Note(
+        velocity=int(note.velocity),
+        pitch=int(note.pitch),
+        start=float(note.start),
+        end=float(note.end),
+    )
+
+
+def collect_all_notes(
+    midi_data: pretty_midi.PrettyMIDI,
+) -> list[pretty_midi.Note]:
+    notes: list[pretty_midi.Note] = []
+
+    for instrument in midi_data.instruments:
+        if instrument.is_drum:
+            continue
+
+        for note in instrument.notes:
+            duration = note.end - note.start
+
+            # অত্যন্ত ছোট note বাদ।
+            if duration < 0.10:
+                continue
+
+            # Piano melody range।
+            if note.pitch < 36:
+                continue
+
+            if note.pitch > 96:
+                continue
+
+            # খুব দুর্বল note বাদ।
+            if note.velocity < 18:
+                continue
+
+            notes.append(
+                copy_note(note)
+            )
+
+    return sorted(
+        notes,
+        key=lambda note: (
+            note.start,
+            -note.velocity,
+            -note.pitch,
+        ),
+    )
+
+
+def group_nearby_onsets(
+    notes: list[pretty_midi.Note],
+    threshold: float = 0.075,
+) -> list[list[pretty_midi.Note]]:
+    if not notes:
+        return []
+
+    groups: list[list[pretty_midi.Note]] = []
+
+    current_group = [notes[0]]
+    group_start = notes[0].start
+
+    for note in notes[1:]:
+        if note.start - group_start <= threshold:
+            current_group.append(note)
+
+        else:
+            groups.append(current_group)
+
+            current_group = [note]
+            group_start = note.start
+
+    groups.append(current_group)
+
+    return groups
+
+
+def note_quality_score(
+    note: pretty_midi.Note,
+) -> float:
+    duration = min(
+        note.end - note.start,
+        1.6,
+    )
+
+    velocity_score = (
+        note.velocity / 127.0
+    ) * 1.55
+
+    duration_score = duration * 0.35
+
+    register_score = 0.0
+
+    # সাধারণ melody register।
+    if 55 <= note.pitch <= 88:
+        register_score = 0.35
+
+    elif note.pitch < 48:
+        register_score = -0.30
+
+    return (
+        velocity_score
+        + duration_score
+        + register_score
+    )
+
+
+def melody_transition_score(
+    previous_note: pretty_midi.Note,
+    current_note: pretty_midi.Note,
+) -> float:
+    pitch_jump = abs(
+        current_note.pitch
+        - previous_note.pitch
+    )
+
+    if pitch_jump <= 2:
+        pitch_score = 0.60
+
+    elif pitch_jump <= 5:
+        pitch_score = 0.42
+
+    elif pitch_jump <= 7:
+        pitch_score = 0.25
+
+    elif pitch_jump <= 12:
+        pitch_score = -0.12
+
+    else:
+        pitch_score = (
+            -0.12
+            - (pitch_jump - 12) * 0.075
+        )
+
+    gap = max(
+        0.0,
+        current_note.start
+        - previous_note.end,
+    )
+
+    gap_penalty = (
+        -max(0.0, gap - 1.5) * 0.10
+    )
+
+    return pitch_score + gap_penalty
+
+
+def select_main_melody(
+    notes: list[pretty_midi.Note],
+) -> list[pretty_midi.Note]:
+    """
+    একই সময়ে একাধিক note থাকলে dynamic programming দিয়ে
+    সবচেয়ে smooth এবং likely melody line নির্বাচন করে।
+    """
+
+    groups = group_nearby_onsets(notes)
+
+    if not groups:
+        return []
+
+    candidates: list[
+        list[pretty_midi.Note]
+    ] = []
+
+    for group in groups:
+        strongest_notes = sorted(
+            group,
+            key=note_quality_score,
+            reverse=True,
+        )[:6]
+
+        candidates.append(strongest_notes)
+
+    scores: list[list[float]] = []
+    backtrack: list[list[int]] = []
+
+    first_scores = [
+        note_quality_score(note)
+        for note in candidates[0]
+    ]
+
+    scores.append(first_scores)
+    backtrack.append(
+        [-1] * len(candidates[0])
+    )
+
+    for group_index in range(
+        1,
+        len(candidates),
+    ):
+        current_scores: list[float] = []
+        current_backtrack: list[int] = []
+
+        for current_note in candidates[group_index]:
+            best_score = -float("inf")
+            best_previous_index = 0
+
+            for (
+                previous_index,
+                previous_note,
+            ) in enumerate(
+                candidates[group_index - 1]
+            ):
+                candidate_score = (
+                    scores[group_index - 1][
+                        previous_index
+                    ]
+                    + note_quality_score(
+                        current_note
+                    )
+                    + melody_transition_score(
+                        previous_note,
+                        current_note,
+                    )
+                )
+
+                if candidate_score > best_score:
+                    best_score = candidate_score
+                    best_previous_index = (
+                        previous_index
+                    )
+
+            current_scores.append(best_score)
+
+            current_backtrack.append(
+                best_previous_index
+            )
+
+        scores.append(current_scores)
+        backtrack.append(current_backtrack)
+
+    selected_index = int(
+        np.argmax(scores[-1])
+    )
+
+    selected_reverse: list[
+        pretty_midi.Note
+    ] = []
+
+    for group_index in range(
+        len(candidates) - 1,
+        -1,
+        -1,
+    ):
+        selected_reverse.append(
+            copy_note(
+                candidates[group_index][
+                    selected_index
+                ]
+            )
+        )
+
+        selected_index = backtrack[
+            group_index
+        ][selected_index]
+
+        if selected_index < 0:
+            break
+
+    selected_notes = list(
+        reversed(selected_reverse)
+    )
+
+    return selected_notes
+
+
+def repair_octave_errors(
+    notes: list[pretty_midi.Note],
+) -> None:
+    """
+    Basic Pitch-এর probable octave jump ভুল ঠিক করে।
+    """
+
+    for index in range(
+        1,
+        len(notes),
+    ):
+        previous_pitch = (
+            notes[index - 1].pitch
+        )
+
+        original_pitch = (
+            notes[index].pitch
+        )
+
+        candidate_pitches = [
+            original_pitch - 24,
+            original_pitch - 12,
+            original_pitch,
+            original_pitch + 12,
+            original_pitch + 24,
+        ]
+
+        candidate_pitches = [
+            pitch
+            for pitch in candidate_pitches
+            if 36 <= pitch <= 96
+        ]
+
+        nearest_pitch = min(
+            candidate_pitches,
+            key=lambda pitch: abs(
+                pitch - previous_pitch
+            ),
+        )
+
+        original_jump = abs(
+            original_pitch - previous_pitch
+        )
+
+        corrected_jump = abs(
+            nearest_pitch - previous_pitch
+        )
+
+        # Only obvious octave mistakes।
+        if (
+            original_jump >= 13
+            and corrected_jump <= 7
+        ):
+            notes[index].pitch = (
+                nearest_pitch
+            )
+
+
+def merge_repeated_notes(
+    notes: list[pretty_midi.Note],
+) -> list[pretty_midi.Note]:
+    if not notes:
+        return []
+
+    cleaned: list[
+        pretty_midi.Note
+    ] = []
+
+    minimum_duration = 0.10
+
+    for note in notes:
+        if not cleaned:
+            cleaned.append(note)
+            continue
+
+        previous_note = cleaned[-1]
+
+        # একই note অল্প gap-এ আবার detect হলে merge।
+        if (
+            note.pitch
+            == previous_note.pitch
+            and note.start
+            - previous_note.end
+            <= 0.075
+        ):
+            previous_note.end = max(
+                previous_note.end,
+                note.end,
+            )
+
+            previous_note.velocity = max(
+                previous_note.velocity,
+                note.velocity,
+            )
+
+            continue
+
+        # একসঙ্গে দুটি melody note বাজতে দেবে না।
+        if note.start < previous_note.end:
+            previous_note.end = max(
+                previous_note.start
+                + minimum_duration,
+                note.start,
+            )
+
+        if (
+            previous_note.end
+            - previous_note.start
+            < minimum_duration
+        ):
+            cleaned.pop()
+
+        cleaned.append(note)
+
+    return [
+        note
+        for note in cleaned
+        if (
+            note.end - note.start
+            >= minimum_duration
+        )
+    ]
+
+
+def quantize_notes(
+    notes: list[pretty_midi.Note],
+    tempo: float,
+) -> None:
+    """
+    Timing একদম robotic না করে 30% quantization করে।
+    """
+
+    quantize_strength = 0.30
+
+    beat_seconds = (
+        60.0 / max(tempo, 1.0)
+    )
+
+    # 1/16 note grid।
+    grid_seconds = beat_seconds / 4.0
+
+    for note in notes:
+        quantized_start = round(
+            note.start / grid_seconds
+        ) * grid_seconds
+
+        quantized_end = round(
+            note.end / grid_seconds
+        ) * grid_seconds
+
+        note.start = (
+            note.start
+            * (1.0 - quantize_strength)
+            + quantized_start
+            * quantize_strength
+        )
+
+        note.end = (
+            note.end
+            * (1.0 - quantize_strength)
+            + quantized_end
+            * quantize_strength
+        )
+
+        if note.end - note.start < 0.10:
+            note.end = note.start + 0.10
+
+
+def improve_piano_velocity(
+    notes: list[pretty_midi.Note],
+) -> None:
+    """
+    সব note একই volume না রেখে natural dynamics তৈরি করে।
+    """
+
+    for index, note in enumerate(notes):
+        phrase_accent = (
+            7 if index % 4 == 0 else 0
+        )
+
+        duration_accent = min(
+            10,
+            int(
+                (note.end - note.start)
+                * 7
+            ),
+        )
+
+        original_velocity = int(
+            (note.velocity - 64) * 0.18
+        )
+
+        final_velocity = (
+            76
+            + phrase_accent
+            + duration_accent
+            + original_velocity
+        )
+
+        note.velocity = int(
+            np.clip(
+                final_velocity,
+                48,
+                108,
+            )
+        )
+
+
+def add_sustain_pedal(
+    piano: pretty_midi.Instrument,
+    notes: list[pretty_midi.Note],
+    tempo: float,
+) -> None:
+    if not notes:
+        return
+
+    beat_seconds = (
+        60.0 / max(tempo, 1.0)
+    )
+
+    pedal_duration = (
+        beat_seconds * 2.0
+    )
+
+    start_time = max(
+        0.0,
+        notes[0].start,
+    )
+
+    ending_time = notes[-1].end
+
+    while start_time < ending_time:
+        release_time = min(
+            start_time
+            + pedal_duration
+            - 0.04,
+            ending_time,
+        )
+
+        piano.control_changes.append(
+            pretty_midi.ControlChange(
+                number=64,
+                value=72,
+                time=start_time,
+            )
+        )
+
+        piano.control_changes.append(
+            pretty_midi.ControlChange(
+                number=64,
+                value=0,
+                time=release_time,
+            )
+        )
+
+        start_time += pedal_duration
+
+
+def create_clean_piano_midi(
+    predicted_midi: pretty_midi.PrettyMIDI,
+    source_audio: Path,
+    output_midi: Path,
+) -> tuple[int, float]:
+    tempo = estimate_tempo(
+        source_audio
+    )
+
+    notes = collect_all_notes(
+        predicted_midi
+    )
+
+    notes = select_main_melody(
+        notes
+    )
+
+    repair_octave_errors(
+        notes
+    )
+
+    notes = merge_repeated_notes(
+        notes
+    )
+
+    quantize_notes(
+        notes,
+        tempo,
+    )
+
+    improve_piano_velocity(
+        notes
+    )
+
+    if not notes:
+        raise PipelineError(
+            "কোনো usable melody note পাওয়া যায়নি। "
+            "আরও পরিষ্কার instrumental music ব্যবহার করো।"
+        )
+
+    output = pretty_midi.PrettyMIDI(
+        initial_tempo=tempo
+    )
+
+    piano_program = (
+        pretty_midi
+        .instrument_name_to_program(
+            "Acoustic Grand Piano"
+        )
+    )
+
+    piano = pretty_midi.Instrument(
+        program=piano_program,
+        is_drum=False,
+        name="TuneMorph Piano",
+    )
+
+    piano.notes.extend(notes)
+
+    add_sustain_pedal(
+        piano,
+        notes,
+        tempo,
+    )
+
+    output.instruments.append(piano)
+
+    output.write(
+        str(output_midi)
+    )
+
+    return len(notes), tempo
+
+
+# =========================================================
+# PIANO RENDERING
+# =========================================================
+
+def render_midi_to_wav(
+    midi_path: Path,
+    wav_path: Path,
+) -> None:
+    fluidsynth = find_executable(
+        FLUIDSYNTH_EXE,
+        "FluidSynth",
+    )
+
+    require_file(
+        PIANO_SF2,
+        "Piano SoundFont",
+    )
+
+    command = [
+        fluidsynth,
+        "-ni",
+
+        # Output volume।
+        "-g",
+        "0.78",
+
+        # Sample rate।
+        "-r",
+        "44100",
+
+        # Output WAV।
+        "-F",
+        str(wav_path),
+
+        # SoundFont।
+        str(PIANO_SF2),
+
+        # MIDI file।
+        str(midi_path),
+    ]
+
+    run_command(
+        command,
+        timeout=1800,
+    )
+
+
+# =========================================================
+# AUDIO POST-PROCESSING
+# =========================================================
+
+def create_final_audio(
+    raw_wav: Path,
+    final_wav: Path,
+    final_mp3: Path,
+) -> None:
+    ffmpeg = find_executable(
+        FFMPEG_EXE,
+        "FFmpeg",
+    )
+
+    audio_filter = (
+        "highpass=f=28,"
+        "lowpass=f=17500,"
+        "loudnorm=I=-16:TP=-1.5:LRA=11"
+    )
+
+    # Final WAV।
+    run_command(
+        [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(raw_wav),
+            "-af",
+            audio_filter,
+            "-c:a",
+            "pcm_s16le",
+            str(final_wav),
+        ],
+        timeout=900,
+    )
+
+    # Final MP3।
+    run_command(
+        [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(final_wav),
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "256k",
+            str(final_mp3),
+        ],
+        timeout=900,
+    )
+
+
+# =========================================================
+# COMPLETE PIPELINE
+# =========================================================
+
+def convert_music_to_piano(
+    uploaded_file: Path,
+    job_work_directory: Path,
+) -> dict:
+    normalized_audio = (
+        job_work_directory
+        / "normalized.wav"
+    )
+
+    normalize_audio(
+        uploaded_file,
+        normalized_audio,
+    )
+
+    instrumental_stem = (
+        separate_instrumental_music(
+            normalized_audio,
+            job_work_directory
+            / "separated",
+        )
+    )
+
+    predicted_midi = transcribe_music(
+        instrumental_stem
+    )
+
+    piano_midi = (
+        job_work_directory
+        / "piano.mid"
+    )
+
+    note_count, tempo = (
+        create_clean_piano_midi(
+            predicted_midi,
+            instrumental_stem,
+            piano_midi,
+        )
+    )
+
+    raw_wav = (
+        job_work_directory
+        / "piano_raw.wav"
+    )
+
+    final_wav = (
+        job_work_directory
+        / "piano.wav"
+    )
+
+    final_mp3 = (
+        job_work_directory
+        / "piano.mp3"
+    )
+
+    render_midi_to_wav(
+        piano_midi,
+        raw_wav,
+    )
+
+    create_final_audio(
+        raw_wav,
+        final_wav,
+        final_mp3,
+    )
+
+    return {
+        "midi": piano_midi,
+        "wav": final_wav,
+        "mp3": final_mp3,
+        "note_count": note_count,
+        "tempo": tempo,
     }
 
-    return settings.get(instrument_name, settings["piano"])
+
+# =========================================================
+# ROUTES
+# =========================================================
+
+@app.get("/")
+def root() -> dict:
+    return {
+        "message": (
+            "TuneMorph Piano API is running."
+        ),
+        "docs": "/docs",
+    }
 
 
-def polish_wav(input_wav_path: Path, output_wav_path: Path, instrument_name: str):
-    """
-    Raw FluidSynth WAV → clean final WAV.
-    """
-    try:
-        import numpy as np
-        import soundfile as sf
+@app.get("/api/health")
+def health() -> dict:
+    return {
+        "ok": True,
+        "fluidsynth_found": (
+            FLUIDSYNTH_EXE.exists()
+        ),
+        "piano_soundfont_found": (
+            PIANO_SF2.exists()
+        ),
+        "ffmpeg_found": (
+            shutil.which(
+                FFMPEG_EXE
+            )
+            is not None
+        ),
+        "demucs_model": DEMUCS_MODEL,
+    }
 
-        from pedalboard import (
-            Pedalboard,
-            HighpassFilter,
-            LowpassFilter,
-            Compressor,
-            Reverb,
-            Limiter,
-        )
-    except Exception as e:
-        raise Exception(
-            "Audio polish libraries missing. Run:\n"
-            ".\\venv311\\Scripts\\python.exe -m pip install pedalboard soundfile numpy\n"
-            f"Original error: {str(e)}"
-        )
 
-    if not input_wav_path.exists():
-        raise Exception(f"Input WAV not found: {input_wav_path}")
-
-    settings = get_polish_settings(instrument_name)
-
-    audio_data, sample_rate = sf.read(
-        str(input_wav_path),
-        dtype="float32",
-        always_2d=True
+@app.post("/api/convert")
+async def convert(
+    file: UploadFile = File(...),
+) -> dict:
+    filename = safe_filename(
+        file.filename
     )
 
-    # samples x channels → channels x samples
-    audio = audio_data.T
-    audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # pre normalize
-    audio = normalize_audio(audio, target_peak=0.68)
-
-    board = Pedalboard([
-        HighpassFilter(cutoff_frequency_hz=settings["highpass"]),
-        LowpassFilter(cutoff_frequency_hz=settings["lowpass"]),
-        Compressor(
-            threshold_db=settings["compressor_threshold"],
-            ratio=settings["compressor_ratio"],
-            attack_ms=14,
-            release_ms=140,
-        ),
-        Reverb(
-            room_size=settings["reverb_room"],
-            damping=0.45,
-            wet_level=settings["reverb_wet"],
-            dry_level=0.94,
-            width=0.80,
-        ),
-        Limiter(
-            threshold_db=-1.0,
-            release_ms=90,
-        ),
-    ])
-
-    processed = board(audio, sample_rate)
-
-    processed = normalize_audio(
-        processed,
-        target_peak=settings["target_peak"]
+    extension = (
+        Path(filename)
+        .suffix
+        .lower()
     )
 
-    # channels x samples → samples x channels
-    processed = processed.T
-    processed = np.clip(processed, -0.98, 0.98)
-
-    sf.write(
-        str(output_wav_path),
-        processed,
-        sample_rate,
-        subtype="PCM_16"
-    )
-
-    if not output_wav_path.exists():
-        raise Exception("Final polished WAV was not created.")
-
-
-@app.post("/convert")
-async def convert_audio(
-    audio: UploadFile = File(...),
-    instrument: str = Form(...)
-):
-    instrument = instrument.lower().strip()
-
-    if instrument not in ALLOWED_INSTRUMENTS:
+    if extension not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported instrument: {instrument}"
+            detail=(
+                "Unsupported audio format. "
+                "Allowed: "
+                + ", ".join(
+                    sorted(
+                        ALLOWED_EXTENSIONS
+                    )
+                )
+            ),
         )
 
-    original_name = audio.filename or "uploaded_audio.mp3"
-    ext = os.path.splitext(original_name)[1]
+    job_id = uuid.uuid4().hex
 
-    if ext == "":
-        ext = ".mp3"
+    upload_directory = (
+        UPLOADS_DIR / job_id
+    )
 
-    file_id = str(uuid.uuid4())
+    work_directory = (
+        WORK_DIR / job_id
+    )
 
-    input_path = UPLOAD_DIR / f"{file_id}{ext}"
-    job_output_dir = OUTPUT_DIR / file_id
-    job_output_dir.mkdir(exist_ok=True)
+    output_directory = (
+        OUTPUTS_DIR / job_id
+    )
 
-    with open(input_path, "wb") as buffer:
-        shutil.copyfileobj(audio.file, buffer)
+    upload_directory.mkdir(
+        parents=True,
+        exist_ok=False,
+    )
 
-    print("===================================")
-    print("AUDIO CONVERT MODE ONLY")
-    print("Uploaded:", original_name)
-    print("Selected instrument:", instrument)
-    print("Input path:", input_path)
-    print("Output folder:", job_output_dir)
+    work_directory.mkdir(
+        parents=True,
+        exist_ok=False,
+    )
+
+    output_directory.mkdir(
+        parents=True,
+        exist_ok=False,
+    )
+
+    uploaded_path = (
+        upload_directory / filename
+    )
 
     try:
-        print("Starting Basic Pitch MIDI conversion...")
-
-        predict_and_save(
-            [str(input_path)],
-            str(job_output_dir),
-            True,   # save MIDI
-            False,  # do not sonify MIDI
-            False,  # do not save model outputs
-            False,  # do not save note events
-            ICASSP_2022_MODEL_PATH,
+        maximum_bytes = (
+            MAX_UPLOAD_MB
+            * 1024
+            * 1024
         )
-    except Exception as e:
-        print("Basic Pitch error:", str(e))
+
+        total_bytes = 0
+
+        with uploaded_path.open(
+            "wb"
+        ) as output_file:
+            while True:
+                chunk = await file.read(
+                    1024 * 1024
+                )
+
+                if not chunk:
+                    break
+
+                total_bytes += len(chunk)
+
+                if total_bytes > maximum_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"File must be smaller "
+                            f"than {MAX_UPLOAD_MB} MB."
+                        ),
+                    )
+
+                output_file.write(chunk)
+
+        result = await run_in_threadpool(
+            convert_music_to_piano,
+            uploaded_path,
+            work_directory,
+        )
+
+        final_midi = (
+            output_directory
+            / "piano.mid"
+        )
+
+        final_wav = (
+            output_directory
+            / "piano.wav"
+        )
+
+        final_mp3 = (
+            output_directory
+            / "piano.mp3"
+        )
+
+        shutil.copy2(
+            result["midi"],
+            final_midi,
+        )
+
+        shutil.copy2(
+            result["wav"],
+            final_wav,
+        )
+
+        shutil.copy2(
+            result["mp3"],
+            final_mp3,
+        )
+
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "note_count": (
+                result["note_count"]
+            ),
+            "estimated_tempo": round(
+                float(result["tempo"]),
+                2,
+            ),
+            "audio_url": (
+                f"/api/output/"
+                f"{job_id}/piano.mp3"
+            ),
+            "wav_url": (
+                f"/api/output/"
+                f"{job_id}/piano.wav"
+            ),
+            "midi_url": (
+                f"/api/output/"
+                f"{job_id}/piano.mid"
+            ),
+        }
+
+    except HTTPException:
+        shutil.rmtree(
+            output_directory,
+            ignore_errors=True,
+        )
+
+        raise
+
+    except PipelineError as error:
+        shutil.rmtree(
+            output_directory,
+            ignore_errors=True,
+        )
+
+        raise HTTPException(
+            status_code=422,
+            detail=str(error),
+        ) from error
+
+    except Exception as error:
+        shutil.rmtree(
+            output_directory,
+            ignore_errors=True,
+        )
+
         raise HTTPException(
             status_code=500,
-            detail=f"Basic Pitch failed: {str(e)}"
+            detail=(
+                f"Conversion failed: {error}"
+            ),
+        ) from error
+
+    finally:
+        await file.close()
+
+        shutil.rmtree(
+            upload_directory,
+            ignore_errors=True,
         )
 
-    midi_files = list(job_output_dir.glob("*.mid")) + list(job_output_dir.glob("*.midi"))
+        shutil.rmtree(
+            work_directory,
+            ignore_errors=True,
+        )
 
-    print("Generated files:")
-    for f in job_output_dir.iterdir():
-        print("-", f.name)
 
-    if not midi_files:
+@app.get(
+    "/api/output/{job_id}/{filename}"
+)
+def get_output_file(
+    job_id: str,
+    filename: str,
+) -> FileResponse:
+    if not re.fullmatch(
+        r"[a-f0-9]{32}",
+        job_id,
+    ):
         raise HTTPException(
-            status_code=500,
-            detail="MIDI file was not generated. Try clean solo instrumental melody audio."
+            status_code=400,
+            detail="Invalid job ID.",
         )
 
-    midi_path = midi_files[0]
+    allowed_files = {
+        "piano.mp3",
+        "piano.wav",
+        "piano.mid",
+    }
 
-    raw_wav_path = job_output_dir / f"raw-{instrument}.wav"
-    final_wav_path = job_output_dir / f"tunemorph-{instrument}-final.wav"
-
-    try:
-        print("Rendering MIDI to raw WAV...")
-        render_midi_to_wav(midi_path, raw_wav_path, instrument)
-
-        print("Polishing WAV...")
-        polish_wav(raw_wav_path, final_wav_path, instrument)
-    except Exception as e:
-        print("Render/Polish error:", str(e))
+    if filename not in allowed_files:
         raise HTTPException(
-            status_code=500,
-            detail=str(e)
+            status_code=404,
+            detail="File not found.",
         )
 
-    print("Final WAV generated:", final_wav_path)
-    print("===================================")
+    output_path = (
+        OUTPUTS_DIR
+        / job_id
+        / filename
+    ).resolve()
+
+    expected_parent = (
+        OUTPUTS_DIR
+        / job_id
+    ).resolve()
+
+    if output_path.parent != expected_parent:
+        raise HTTPException(
+            status_code=404,
+            detail="File not found.",
+        )
+
+    if not output_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="File not found.",
+        )
+
+    media_types = {
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".mid": "audio/midi",
+    }
 
     return FileResponse(
-        path=str(final_wav_path),
-        media_type="audio/wav",
-        filename=f"tunemorph-{instrument}-final.wav"
+        output_path,
+        media_type=media_types[
+            output_path.suffix.lower()
+        ],
+        filename=filename,
     )
